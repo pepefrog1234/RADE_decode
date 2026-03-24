@@ -108,9 +108,11 @@ class AudioManager: ObservableObject {
     private var sourceNode: AVAudioSourceNode?
     
     // Dedicated processing queue to avoid blocking the real-time audio thread.
-    // Using .utility QoS so iOS doesn't penalize us for sustained CPU in background.
+    // .userInitiated keeps processing near real-time for responsive sync display.
     private let processingQueue = DispatchQueue(label: "com.freedv.rade.processing",
-                                                 qos: .utility)
+                                                 qos: .userInitiated)
+    /// Separate queue for FFT so it's not blocked by RADE neural network processing.
+    private let fftQueue = DispatchQueue(label: "com.freedv.fft", qos: .default)
     
     /// Flag to signal processingQueue to skip work during shutdown
     private var shouldProcess = false
@@ -277,10 +279,14 @@ class AudioManager: ObservableObject {
         if wasRunning {
             do {
                 try audioEngine.start()
+                // CRITICAL: Re-disable voice processing after mode switch.
+                // .default mode re-enables echo cancellation & noise suppression,
+                // which completely destroys the RADE modem signal and prevents sync.
+                try inputNode.setVoiceProcessingEnabled(false)
                 if !background {
                     applyFixedInputGain()
                 }
-                bgLog("Engine restarted after mode switch (running=\(audioEngine.isRunning))")
+                bgLog("Engine restarted after mode switch (running=\(audioEngine.isRunning), voiceProc=off)")
             } catch {
                 bgLog("Failed to restart engine: \(error)")
             }
@@ -480,6 +486,9 @@ class AudioManager: ObservableObject {
                     
                     // Start a new session if none is active
                     if !self.sessionActive {
+                        if self.backgroundMode {
+                            bgLog("Sync gained in background — starting session")
+                        }
                         self.beginNewSubSession()
                     }
                 } else if self.sessionActive && self.unsyncGraceTimer == nil {
@@ -632,14 +641,8 @@ class AudioManager: ObservableObject {
                         data[i] *= vol
                     }
                 }
-                // Fill unfilled portion with micro-noise (~-80dB alternating signal)
-                // to keep the audio render pipeline active for iOS background execution.
-                // At this level it's well below any speaker's noise floor — inaudible.
-                if read < frames {
-                    for i in read..<frames {
-                        data[i] = (i & 1 == 0) ? 1.0e-4 : -1.0e-4
-                    }
-                }
+                // Unfilled portion is already zeroed by ring.read() — silence is fine
+                // because background execution is maintained by location + audio modes.
             }
             
             return noErr
@@ -876,12 +879,21 @@ class AudioManager: ObservableObject {
         // Copy samples off the audio thread for RADE processing and FFT
         let samplesCopy = Array(UnsafeBufferPointer(start: samples, count: convertedCount))
         
+        // RADE processing (may take 10-50ms per chunk due to neural network)
         processingQueue.async { [weak self] in
             guard let self = self, self.shouldProcess else { return }
             samplesCopy.withUnsafeBufferPointer { buf in
                 guard let ptr = buf.baseAddress else { return }
                 self.radeWrapper.rxProcessInputSamples(ptr, count: Int32(convertedCount))
-                if self.fftEnabled {
+            }
+        }
+        
+        // FFT on a separate queue so it's not blocked by RADE
+        if fftEnabled {
+            fftQueue.async { [weak self] in
+                guard let self = self else { return }
+                samplesCopy.withUnsafeBufferPointer { buf in
+                    guard let ptr = buf.baseAddress else { return }
                     self.accumulateForFFT(samples: ptr, count: convertedCount)
                 }
             }

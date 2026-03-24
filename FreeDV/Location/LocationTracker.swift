@@ -21,10 +21,24 @@ class LocationTracker: NSObject, CLLocationManagerDelegate {
     override init() {
         super.init()
         manager.delegate = self
-        manager.desiredAccuracy = kCLLocationAccuracyHundredMeters  // Low power
+        manager.desiredAccuracy = kCLLocationAccuracyHundredMeters  // Low power (cell/WiFi)
         manager.distanceFilter = 100  // Only update on 100m movement
         manager.activityType = .other
-        manager.pausesLocationUpdatesAutomatically = true
+        // Don't auto-pause — we need continuous updates for background reception logging
+        manager.pausesLocationUpdatesAutomatically = false
+    }
+    
+    /// Request "Always" authorization for background location updates.
+    /// Must be called after the user has already granted "When In Use".
+    func requestAlwaysAuthorization() {
+        let status = manager.authorizationStatus
+        if status == .notDetermined {
+            // First ask for When In Use, then escalate later
+            manager.requestWhenInUseAuthorization()
+        } else if status == .authorizedWhenInUse {
+            // Escalate to Always
+            manager.requestAlwaysAuthorization()
+        }
     }
     
     /// Start tracking when RX begins (if enabled and authorized).
@@ -41,14 +55,22 @@ class LocationTracker: NSObject, CLLocationManagerDelegate {
             return
         }
         
+        // Enable background location updates if authorized for Always
+        if status == .authorizedAlways {
+            manager.allowsBackgroundLocationUpdates = true
+            manager.showsBackgroundLocationIndicator = true
+            appLog("LocationTracker: background location enabled")
+        }
+        
         manager.startUpdatingLocation()
         isTracking = true
-        appLog("LocationTracker: started")
+        appLog("LocationTracker: started (auth=\(status.rawValue))")
     }
     
     /// Stop tracking when RX stops.
     func stopTracking() {
         manager.stopUpdatingLocation()
+        manager.allowsBackgroundLocationUpdates = false
         isTracking = false
         appLog("LocationTracker: stopped")
     }
@@ -69,8 +91,14 @@ class LocationTracker: NSObject, CLLocationManagerDelegate {
     }
     
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
-        if (manager.authorizationStatus == .authorizedWhenInUse ||
-            manager.authorizationStatus == .authorizedAlways) && isEnabled {
+        let status = manager.authorizationStatus
+        appLog("LocationTracker: auth changed to \(status.rawValue)")
+        
+        if (status == .authorizedWhenInUse || status == .authorizedAlways) && isEnabled {
+            if status == .authorizedAlways {
+                manager.allowsBackgroundLocationUpdates = true
+                manager.showsBackgroundLocationIndicator = true
+            }
             manager.startUpdatingLocation()
             isTracking = true
         }

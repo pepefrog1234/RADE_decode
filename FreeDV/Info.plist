@@ -15,9 +15,12 @@
 	</dict>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>FreeDV uses your location to calculate your Maidenhead grid square for the FreeDV Reporter.</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>FreeDV records your GPS position when radio signals are received in the background, enabling accurate reception logging and Maidenhead grid square reporting.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>
+		<string>location</string>
 	</array>
 	<key>NSSupportsLiveActivities</key>
 	<true/>

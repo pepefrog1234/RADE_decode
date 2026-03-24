@@ -294,17 +294,16 @@ class TransceiverViewModel: ObservableObject {
         }
         
         #if os(iOS)
-        // Request extra time FIRST — we need it while we stop/restart the engine for mode switch
+        // Request extra time during background transition
         audioManager.beginBackgroundTask()
-        // Switch audio session to .default mode for better background compatibility.
-        // .measurement mode is not recognized by iOS as legitimate background audio.
-        // This briefly stops and restarts the engine (setCategory requires engine to be stopped).
-        audioManager.setBackgroundAudioMode(true)
-        // Re-assert session to signal iOS we're still using audio
+        // Re-assert audio session to signal iOS we're still using audio.
+        // We do NOT switch audio mode — .measurement mode must stay to preserve
+        // modem signal quality. Background execution is maintained by the location
+        // background mode (UIBackgroundModes: location) instead.
         audioManager.reassertAudioSession()
         #endif
         
-        bgLog("ViewModel: entered background mode (FFT off, timer stopped, mode=default)")
+        bgLog("ViewModel: entered background mode (FFT off, timer stopped)")
     }
     
     private func exitBackground() {
@@ -315,8 +314,6 @@ class TransceiverViewModel: ObservableObject {
         LogManager.shared.backgroundMode = false
         
         #if os(iOS)
-        // Switch audio session back to .measurement mode for best modem quality
-        audioManager.setBackgroundAudioMode(false)
         // End background task if still active
         audioManager.endBackgroundTask()
         #endif
