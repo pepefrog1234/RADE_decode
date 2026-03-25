@@ -127,6 +127,8 @@ class AudioManager: ObservableObject {
     private let maxPendingProcessingChunks = 6
     private let maxPendingProcessingChunksInBackground = 2
     private var droppedProcessingChunks = 0
+    /// Last observed modem sync status, used by background throttle policy.
+    private var isModemSyncedForBackground = false
     /// Background decode base stride. Adaptive logic raises this under load.
     private let backgroundDecodeBaseStride = 1
     private var backgroundChunkCounter = 0
@@ -216,6 +218,7 @@ class AudioManager: ObservableObject {
             backgroundHeartbeatLastDate = nil
             backgroundRxChunkCount = 0
             backgroundRxChunkLastDate = nil
+            isModemSyncedForBackground = false
         }
     }
 
@@ -413,6 +416,7 @@ class AudioManager: ObservableObject {
                 self.processingBackpressureLock.lock()
                 let pending = self.pendingProcessingChunks
                 let dropped = self.droppedProcessingChunks
+                let isSynced = self.isModemSyncedForBackground
                 self.processingBackpressureLock.unlock()
                 let loadLevel: Int
                 if pending >= 5 {
@@ -422,7 +426,7 @@ class AudioManager: ObservableObject {
                 } else {
                     loadLevel = 1
                 }
-                bgLog("Health tick: engine=\(engineRunning) pending=\(pending) dropped=\(dropped) load=\(loadLevel)")
+                bgLog("Health tick: engine=\(engineRunning) pending=\(pending) dropped=\(dropped) load=\(loadLevel) synced=\(isSynced)")
             }
             if !engineRunning {
                 bgLog("Health check: engine NOT running — restarting")
@@ -578,6 +582,9 @@ class AudioManager: ObservableObject {
             guard let self = self else { return }
             
             let isSynced = syncState == 2
+            self.processingBackpressureLock.lock()
+            self.isModemSyncedForBackground = isSynced
+            self.processingBackpressureLock.unlock()
             
             // Session lifecycle with grace period for brief sync drops
             if self.shouldProcess {
@@ -803,6 +810,7 @@ class AudioManager: ObservableObject {
         pendingProcessingChunks = 0
         droppedProcessingChunks = 0
         backgroundChunkCounter = 0
+        isModemSyncedForBackground = false
         processingBackpressureLock.unlock()
         installInputTapIfNeeded(with: inputFormat)
         
@@ -839,6 +847,7 @@ class AudioManager: ObservableObject {
         pendingProcessingChunks = 0
         droppedProcessingChunks = 0
         backgroundChunkCounter = 0
+        isModemSyncedForBackground = false
         processingBackpressureLock.unlock()
         
         // Stop health monitoring
@@ -1016,13 +1025,26 @@ class AudioManager: ObservableObject {
         var effectiveMaxPending = maxPendingProcessingChunks
         if backgroundMode {
             effectiveMaxPending = maxPendingProcessingChunksInBackground
+            let isSynced = isModemSyncedForBackground
             let adaptiveStride: Int
-            if pendingProcessingChunks >= 2 {
-                adaptiveStride = 6
-            } else if pendingProcessingChunks >= 1 {
-                adaptiveStride = 3
+            if isSynced {
+                // Synced: prioritize continuity while still applying backpressure.
+                if pendingProcessingChunks >= 2 {
+                    adaptiveStride = 3
+                } else if pendingProcessingChunks >= 1 {
+                    adaptiveStride = 2
+                } else {
+                    adaptiveStride = 1
+                }
             } else if pendingProcessingChunks >= 0 {
-                adaptiveStride = 2
+                // Unsynced/searching: aggressive throttling to protect background survival.
+                if pendingProcessingChunks >= 2 {
+                    adaptiveStride = 8
+                } else if pendingProcessingChunks >= 1 {
+                    adaptiveStride = 4
+                } else {
+                    adaptiveStride = 2
+                }
             } else {
                 adaptiveStride = backgroundDecodeBaseStride
             }
