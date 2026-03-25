@@ -7,23 +7,24 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		192DD5262F735DDC00CF7708 /* fix_compliance.sh in Resources */ = {isa = PBXBuildFile; fileRef = 192DD5252F735DDC00CF7708 /* fix_compliance.sh */; };
 		197838B72F70A51900D284DA /* RADE.xcconfig in Resources */ = {isa = PBXBuildFile; fileRef = 197838B62F70A51900D284DA /* RADE.xcconfig */; };
 		197838DC2F70AC8600D284DA /* rade_nnet.c in Sources */ = {isa = PBXBuildFile; fileRef = 197838DB2F70AC8600D284DA /* rade_nnet.c */; };
 		197838E02F70CDDF00D284DA /* eoo_callsign_codec_c.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 197838DF2F70CDDF00D284DA /* eoo_callsign_codec_c.cpp */; };
 		197838E22F70CE9B00D284DA /* EooCallsignCodec.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 197838E12F70CE9B00D284DA /* EooCallsignCodec.cpp */; };
-		199C227C2F72920B00727B05 /* WidgetKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 199C227B2F72920B00727B05 /* WidgetKit.framework */; };
-		199C227E2F72920B00727B05 /* SwiftUI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 199C227D2F72920B00727B05 /* SwiftUI.framework */; };
-		199C228D2F72920C00727B05 /* FreeDVWidgetExtensionExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 199C22792F72920B00727B05 /* FreeDVWidgetExtensionExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		199C22B12F7347A200727B05 /* WidgetKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 199C227B2F72920B00727B05 /* WidgetKit.framework */; };
+		199C22B22F7347A200727B05 /* SwiftUI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 199C227D2F72920B00727B05 /* SwiftUI.framework */; };
+		199C22C12F7347A300727B05 /* FreeDVWidgetExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 199C22B02F7347A200727B05 /* FreeDVWidgetExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		19RADE0001F70A85200D284D /* rade_all.c in Sources */ = {isa = PBXBuildFile; fileRef = 197838BA2F70A85200D284DA /* rade_all.c */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
-		199C228B2F72920C00727B05 /* PBXContainerItemProxy */ = {
+		199C22BF2F7347A300727B05 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = 197838572F7028A000D284DA /* Project object */;
 			proxyType = 1;
-			remoteGlobalIDString = 199C22782F72920B00727B05;
-			remoteInfo = FreeDVWidgetExtensionExtension;
+			remoteGlobalIDString = 199C22AF2F7347A200727B05;
+			remoteInfo = FreeDVWidgetExtension;
 		};
 /* End PBXContainerItemProxy section */
 
@@ -34,7 +35,7 @@
 			dstPath = "";
 			dstSubfolderSpec = 13;
 			files = (
-				199C228D2F72920C00727B05 /* FreeDVWidgetExtensionExtension.appex in Embed Foundation Extensions */,
+				199C22C12F7347A300727B05 /* FreeDVWidgetExtension.appex in Embed Foundation Extensions */,
 			);
 			name = "Embed Foundation Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -42,6 +43,7 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		192DD5252F735DDC00CF7708 /* fix_compliance.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = fix_compliance.sh; sourceTree = "<group>"; };
 		1978385F2F7028A000D284DA /* FreeDV.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FreeDV.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		1978388E2F702DFA00D284DA /* build_opus.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = build_opus.sh; sourceTree = "<group>"; };
 		197838932F703AED00D284DA /* config.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = config.h; sourceTree = "<group>"; };
@@ -73,10 +75,9 @@
 		197838DE2F70CDDE00D284DA /* eoo_callsign_codec_c.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = eoo_callsign_codec_c.h; sourceTree = "<group>"; };
 		197838DF2F70CDDF00D284DA /* eoo_callsign_codec_c.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = eoo_callsign_codec_c.cpp; sourceTree = "<group>"; };
 		197838E12F70CE9B00D284DA /* EooCallsignCodec.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = EooCallsignCodec.cpp; sourceTree = "<group>"; };
-		199C22792F72920B00727B05 /* FreeDVWidgetExtensionExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = FreeDVWidgetExtensionExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		199C227B2F72920B00727B05 /* WidgetKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WidgetKit.framework; path = System/Library/Frameworks/WidgetKit.framework; sourceTree = SDKROOT; };
 		199C227D2F72920B00727B05 /* SwiftUI.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SwiftUI.framework; path = System/Library/Frameworks/SwiftUI.framework; sourceTree = SDKROOT; };
-		199C22A92F7293CC00727B05 /* FreeDVWidgetExtensionExtension.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = FreeDVWidgetExtensionExtension.entitlements; sourceTree = "<group>"; };
+		199C22B02F7347A200727B05 /* FreeDVWidgetExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = FreeDVWidgetExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -87,12 +88,12 @@
 			);
 			target = 1978385E2F7028A000D284DA /* FreeDV */;
 		};
-		199C22912F72920C00727B05 /* Exceptions for "FreeDVWidgetExtension" folder in "FreeDVWidgetExtensionExtension" target */ = {
+		199C22C52F7347A300727B05 /* Exceptions for "FreeDVWidgetExtension" folder in "FreeDVWidgetExtension" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Info.plist,
 			);
-			target = 199C22782F72920B00727B05 /* FreeDVWidgetExtensionExtension */;
+			target = 199C22AF2F7347A200727B05 /* FreeDVWidgetExtension */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
@@ -108,7 +109,7 @@
 		199C227F2F72920B00727B05 /* FreeDVWidgetExtension */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
-				199C22912F72920C00727B05 /* Exceptions for "FreeDVWidgetExtension" folder in "FreeDVWidgetExtensionExtension" target */,
+				199C22C52F7347A300727B05 /* Exceptions for "FreeDVWidgetExtension" folder in "FreeDVWidgetExtension" target */,
 			);
 			path = FreeDVWidgetExtension;
 			sourceTree = "<group>";
@@ -123,12 +124,12 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		199C22762F72920B00727B05 /* Frameworks */ = {
+		199C22AD2F7347A200727B05 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				199C227E2F72920B00727B05 /* SwiftUI.framework in Frameworks */,
-				199C227C2F72920B00727B05 /* WidgetKit.framework in Frameworks */,
+				199C22B22F7347A200727B05 /* SwiftUI.framework in Frameworks */,
+				199C22B12F7347A200727B05 /* WidgetKit.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -138,7 +139,6 @@
 		197838562F7028A000D284DA = {
 			isa = PBXGroup;
 			children = (
-				199C22A92F7293CC00727B05 /* FreeDVWidgetExtensionExtension.entitlements */,
 				197838B62F70A51900D284DA /* RADE.xcconfig */,
 				197838612F7028A000D284DA /* FreeDV */,
 				199C227F2F72920B00727B05 /* FreeDVWidgetExtension */,
@@ -146,6 +146,7 @@
 				197838602F7028A000D284DA /* Products */,
 				197838742F702D0E00D284DA /* Scripts */,
 				197838752F702D1100D284DA /* Libraries */,
+				192DD5252F735DDC00CF7708 /* fix_compliance.sh */,
 			);
 			sourceTree = "<group>";
 		};
@@ -153,7 +154,7 @@
 			isa = PBXGroup;
 			children = (
 				1978385F2F7028A000D284DA /* FreeDV.app */,
-				199C22792F72920B00727B05 /* FreeDVWidgetExtensionExtension.appex */,
+				199C22B02F7347A200727B05 /* FreeDVWidgetExtension.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -257,7 +258,7 @@
 			buildRules = (
 			);
 			dependencies = (
-				199C228C2F72920C00727B05 /* PBXTargetDependency */,
+				199C22C02F7347A300727B05 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				197838612F7028A000D284DA /* FreeDV */,
@@ -269,13 +270,13 @@
 			productReference = 1978385F2F7028A000D284DA /* FreeDV.app */;
 			productType = "com.apple.product-type.application";
 		};
-		199C22782F72920B00727B05 /* FreeDVWidgetExtensionExtension */ = {
+		199C22AF2F7347A200727B05 /* FreeDVWidgetExtension */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 199C228E2F72920C00727B05 /* Build configuration list for PBXNativeTarget "FreeDVWidgetExtensionExtension" */;
+			buildConfigurationList = 199C22C22F7347A300727B05 /* Build configuration list for PBXNativeTarget "FreeDVWidgetExtension" */;
 			buildPhases = (
-				199C22752F72920B00727B05 /* Sources */,
-				199C22762F72920B00727B05 /* Frameworks */,
-				199C22772F72920B00727B05 /* Resources */,
+				199C22AC2F7347A200727B05 /* Sources */,
+				199C22AD2F7347A200727B05 /* Frameworks */,
+				199C22AE2F7347A200727B05 /* Resources */,
 			);
 			buildRules = (
 			);
@@ -284,11 +285,11 @@
 			fileSystemSynchronizedGroups = (
 				199C227F2F72920B00727B05 /* FreeDVWidgetExtension */,
 			);
-			name = FreeDVWidgetExtensionExtension;
+			name = FreeDVWidgetExtension;
 			packageProductDependencies = (
 			);
-			productName = FreeDVWidgetExtensionExtension;
-			productReference = 199C22792F72920B00727B05 /* FreeDVWidgetExtensionExtension.appex */;
+			productName = FreeDVWidgetExtension;
+			productReference = 199C22B02F7347A200727B05 /* FreeDVWidgetExtension.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
 /* End PBXNativeTarget section */
@@ -304,7 +305,7 @@
 					1978385E2F7028A000D284DA = {
 						CreatedOnToolsVersion = 26.3;
 					};
-					199C22782F72920B00727B05 = {
+					199C22AF2F7347A200727B05 = {
 						CreatedOnToolsVersion = 26.4;
 					};
 				};
@@ -324,7 +325,7 @@
 			projectRoot = "";
 			targets = (
 				1978385E2F7028A000D284DA /* FreeDV */,
-				199C22782F72920B00727B05 /* FreeDVWidgetExtensionExtension */,
+				199C22AF2F7347A200727B05 /* FreeDVWidgetExtension */,
 			);
 		};
 /* End PBXProject section */
@@ -335,10 +336,11 @@
 			buildActionMask = 2147483647;
 			files = (
 				197838B72F70A51900D284DA /* RADE.xcconfig in Resources */,
+				192DD5262F735DDC00CF7708 /* fix_compliance.sh in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		199C22772F72920B00727B05 /* Resources */ = {
+		199C22AE2F7347A200727B05 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -359,7 +361,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		199C22752F72920B00727B05 /* Sources */ = {
+		199C22AC2F7347A200727B05 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -369,10 +371,10 @@
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
-		199C228C2F72920C00727B05 /* PBXTargetDependency */ = {
+		199C22C02F7347A300727B05 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
-			target = 199C22782F72920B00727B05 /* FreeDVWidgetExtensionExtension */;
-			targetProxy = 199C228B2F72920C00727B05 /* PBXContainerItemProxy */;
+			target = 199C22AF2F7347A200727B05 /* FreeDVWidgetExtension */;
+			targetProxy = 199C22BF2F7347A300727B05 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -431,11 +433,11 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
-				MACOSX_DEPLOYMENT_TARGET = 26.2;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
-				SDKROOT = macosx;
+				SDKROOT = iphoneos;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 			};
@@ -489,10 +491,10 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
-				MACOSX_DEPLOYMENT_TARGET = 26.2;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
-				SDKROOT = macosx;
+				SDKROOT = iphoneos;
 				SWIFT_COMPILATION_MODE = wholemodule;
 			};
 			name = Release;
@@ -517,6 +519,7 @@
 				INFOPLIST_FILE = FreeDV/Info.plist;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "FreeDV needs microphone access for radio transceiver audio processing.";
+				IPHONEOS_DEPLOYMENT_TARGET = 18.6;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -525,6 +528,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = yakumo2683.FreeDV;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
+				SDKROOT = iphoneos;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
@@ -557,6 +561,7 @@
 				INFOPLIST_FILE = FreeDV/Info.plist;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "FreeDV needs microphone access for radio transceiver audio processing.";
+				IPHONEOS_DEPLOYMENT_TARGET = 18.6;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -565,6 +570,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = yakumo2683.FreeDV;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
+				SDKROOT = iphoneos;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
@@ -577,12 +583,11 @@
 			};
 			name = Release;
 		};
-		199C228F2F72920C00727B05 /* Debug */ = {
+		199C22C32F7347A300727B05 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				ASSETCATALOG_COMPILER_WIDGET_BACKGROUND_COLOR_NAME = WidgetBackground;
-				CODE_SIGN_ENTITLEMENTS = FreeDVWidgetExtensionExtension.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
@@ -611,12 +616,11 @@
 			};
 			name = Debug;
 		};
-		199C22902F72920C00727B05 /* Release */ = {
+		199C22C42F7347A300727B05 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				ASSETCATALOG_COMPILER_WIDGET_BACKGROUND_COLOR_NAME = WidgetBackground;
-				CODE_SIGN_ENTITLEMENTS = FreeDVWidgetExtensionExtension.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
@@ -667,11 +671,11 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		199C228E2F72920C00727B05 /* Build configuration list for PBXNativeTarget "FreeDVWidgetExtensionExtension" */ = {
+		199C22C22F7347A300727B05 /* Build configuration list for PBXNativeTarget "FreeDVWidgetExtension" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				199C228F2F72920C00727B05 /* Debug */,
-				199C22902F72920C00727B05 /* Release */,
+				199C22C32F7347A300727B05 /* Debug */,
+				199C22C42F7347A300727B05 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;

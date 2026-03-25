@@ -82,7 +82,7 @@ struct FreeDVLiveActivityWidget: Widget {
             // Main info
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
-                    Text("FreeDV SWL")
+                    Text("RADE Decode")
                         .font(.system(size: 13, weight: .bold))
                     Spacer()
                     Text(context.attributes.frequencyMHz + " MHz")

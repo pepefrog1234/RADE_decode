@@ -333,7 +333,7 @@ class FreeDVReporter {
                 "role": "report",
                 "callsign": callsign.uppercased(),
                 "grid_square": gridSquare,
-                "version": "FreeDV iOS \(Bundle.main.shortVersion)",
+                "version": "RADE Decode iOS \(Bundle.main.shortVersion)",
                 "rx_only": true,
                 "os": osVersion,
                 "protocol_version": protocolVersion

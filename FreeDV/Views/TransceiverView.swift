@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import CoreLocation
 
 /// Main transceiver UI — professional ham radio interface with dark theme.
 struct TransceiverView: View {
@@ -96,7 +97,7 @@ struct TransceiverView: View {
                     }
                 }
             }
-            .navigationTitle("FreeDV RADE")
+            .navigationTitle("RADE Decode")
             #if os(iOS)
             .toolbarColorScheme(.dark, for: .navigationBar)
             .toolbarBackground(Color(white: 0.08), for: .navigationBar)
@@ -188,9 +189,9 @@ struct StatusBar: View {
                 Text("SNR")
                     .font(.system(size: 9, weight: .medium, design: .monospaced))
                     .foregroundStyle(.secondary)
-                Text(String(format: "%+.1f", snr))
+                Text(syncState == .synced ? String(format: "%+.1f", snr) : "--")
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundStyle(snrColor)
+                    .foregroundStyle(syncState == .synced ? snrColor : .secondary)
             }
             
             Spacer()
@@ -200,9 +201,9 @@ struct StatusBar: View {
                 Text("dF")
                     .font(.system(size: 9, weight: .medium, design: .monospaced))
                     .foregroundStyle(.secondary)
-                Text(String(format: "%+.0f", freqOffset))
+                Text(syncState == .synced ? String(format: "%+.0f", freqOffset) : "--")
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundStyle(.primary)
+                    .foregroundStyle(syncState == .synced ? .primary : .secondary)
             }
             
             // Reporter indicator
@@ -267,11 +268,28 @@ struct BottomControls: View {
                 .lineLimit(1)
                 
                 if viewModel.isRunning {
-                    Text("Continues in background")
-                        .font(.system(size: 9))
-                        .foregroundStyle(Color.gray.opacity(0.35))
+                    BackgroundHintLabel()
                 }
             }
+        }
+    }
+}
+
+// MARK: - Background Hint
+
+/// Shows a small hint below the start button about background reception status.
+struct BackgroundHintLabel: View {
+    private let authStatus = CLLocationManager().authorizationStatus
+    
+    var body: some View {
+        if authStatus == .authorizedAlways {
+            Text("Continues in background")
+                .font(.system(size: 9))
+                .foregroundStyle(Color.gray.opacity(0.35))
+        } else {
+            Text("Enable \"Always\" location in Settings for background RX")
+                .font(.system(size: 9))
+                .foregroundStyle(Color.orange.opacity(0.6))
         }
     }
 }

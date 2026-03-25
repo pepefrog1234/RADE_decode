@@ -4,7 +4,6 @@ import SwiftUI
 @main
 struct FreeDVWidgetBundle: WidgetBundle {
     var body: some Widget {
-        FreeDVWidget()
         FreeDVLiveActivityWidget()
     }
 }

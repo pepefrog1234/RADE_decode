@@ -1,18 +1,23 @@
 import CoreLocation
 
-/// Low-power GPS tracker for reception logging.
-/// Provides current location during RX sessions with minimal battery impact.
+/// Location tracker that serves two purposes:
+/// 1. Background keep-alive: location updates keep the app running in background
+///    (always active when RX is running, regardless of user preference)
+/// 2. GPS logging: records coordinates for reception sessions
+///    (only when user enables "Track Location During RX" in Settings)
 class LocationTracker: NSObject, CLLocationManagerDelegate {
     
     private let manager = CLLocationManager()
     
-    /// Most recent location (updated on significant movement)
+    /// Most recent location (updated continuously)
     private(set) var currentLocation: CLLocation?
     
-    /// Whether tracking is actively running
+    /// Whether location updates are actively running
     private(set) var isTracking = false
     
-    /// User preference for GPS tracking
+    /// User preference for GPS coordinate logging in reception sessions.
+    /// This does NOT control whether location updates run — those always run
+    /// when RX is active to keep the app alive in background.
     var isEnabled: Bool {
         get { UserDefaults.standard.object(forKey: "gpsTrackingEnabled") as? Bool ?? false }
         set { UserDefaults.standard.set(newValue, forKey: "gpsTrackingEnabled") }
@@ -21,10 +26,13 @@ class LocationTracker: NSObject, CLLocationManagerDelegate {
     override init() {
         super.init()
         manager.delegate = self
-        manager.desiredAccuracy = kCLLocationAccuracyHundredMeters  // Low power (cell/WiFi)
-        manager.distanceFilter = 100  // Only update on 100m movement
+        // Use reduced accuracy (cell/WiFi) for minimal battery impact.
+        // distanceFilter = none ensures iOS keeps delivering updates even when
+        // stationary, which is critical for keeping the app alive in background.
+        manager.desiredAccuracy = kCLLocationAccuracyThreeKilometers
+        manager.distanceFilter = kCLDistanceFilterNone
         manager.activityType = .other
-        // Don't auto-pause — we need continuous updates for background reception logging
+        // Don't auto-pause — we need continuous updates for background reception
         manager.pausesLocationUpdatesAutomatically = false
     }
     
@@ -33,38 +41,32 @@ class LocationTracker: NSObject, CLLocationManagerDelegate {
     func requestAlwaysAuthorization() {
         let status = manager.authorizationStatus
         if status == .notDetermined {
-            // First ask for When In Use, then escalate later
             manager.requestWhenInUseAuthorization()
         } else if status == .authorizedWhenInUse {
-            // Escalate to Always
             manager.requestAlwaysAuthorization()
         }
     }
     
-    /// Start tracking when RX begins (if enabled and authorized).
+    /// Start location updates when RX begins.
+    /// Always starts if authorized — background keep-alive requires continuous
+    /// location updates regardless of the GPS logging preference.
     func startTracking() {
-        guard isEnabled else { return }
-        
         let status = manager.authorizationStatus
         if status == .notDetermined {
             manager.requestWhenInUseAuthorization()
+            appLog("LocationTracker: requesting authorization")
             return
         }
         guard status == .authorizedWhenInUse || status == .authorizedAlways else {
-            appLog("LocationTracker: not authorized (status=\(status.rawValue))")
+            appLog("LocationTracker: not authorized (status=\(status.rawValue)) — background keep-alive unavailable")
             return
         }
         
-        // Enable background location updates if authorized for Always
-        if status == .authorizedAlways {
-            manager.allowsBackgroundLocationUpdates = true
-            manager.showsBackgroundLocationIndicator = true
-            appLog("LocationTracker: background location enabled")
-        }
-        
+        manager.allowsBackgroundLocationUpdates = true
+        manager.showsBackgroundLocationIndicator = (status == .authorizedWhenInUse)
         manager.startUpdatingLocation()
         isTracking = true
-        appLog("LocationTracker: started (auth=\(status.rawValue))")
+        appLog("LocationTracker: started (auth=\(status.rawValue), gpsLogging=\(isEnabled))")
     }
     
     /// Stop tracking when RX stops.
@@ -75,14 +77,14 @@ class LocationTracker: NSObject, CLLocationManagerDelegate {
         appLog("LocationTracker: stopped")
     }
     
-    /// Current latitude or nil
-    var latitude: Double? { currentLocation?.coordinate.latitude }
+    /// Current latitude — only returns value when GPS logging is enabled
+    var latitude: Double? { isEnabled ? currentLocation?.coordinate.latitude : nil }
     
-    /// Current longitude or nil
-    var longitude: Double? { currentLocation?.coordinate.longitude }
+    /// Current longitude — only returns value when GPS logging is enabled
+    var longitude: Double? { isEnabled ? currentLocation?.coordinate.longitude : nil }
     
-    /// Current altitude or nil
-    var altitude: Double? { currentLocation?.altitude }
+    /// Current altitude — only returns value when GPS logging is enabled
+    var altitude: Double? { isEnabled ? currentLocation?.altitude : nil }
     
     // MARK: - CLLocationManagerDelegate
     
@@ -94,13 +96,13 @@ class LocationTracker: NSObject, CLLocationManagerDelegate {
         let status = manager.authorizationStatus
         appLog("LocationTracker: auth changed to \(status.rawValue)")
         
-        if (status == .authorizedWhenInUse || status == .authorizedAlways) && isEnabled {
-            if status == .authorizedAlways {
-                manager.allowsBackgroundLocationUpdates = true
-                manager.showsBackgroundLocationIndicator = true
-            }
+        // Auto-start if we were waiting for authorization
+        if (status == .authorizedWhenInUse || status == .authorizedAlways) && !isTracking {
+            manager.allowsBackgroundLocationUpdates = true
+            manager.showsBackgroundLocationIndicator = (status == .authorizedWhenInUse)
             manager.startUpdatingLocation()
             isTracking = true
+            appLog("LocationTracker: auto-started after auth grant")
         }
     }
     

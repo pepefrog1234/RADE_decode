@@ -88,8 +88,7 @@ class TransceiverViewModel: ObservableObject {
     private var previousCallsign: String = ""
     /// Throttle strong signal haptics (at most once per 10 seconds)
     private var lastStrongSignalHaptic: Date = .distantPast
-    /// Throttle widget shared state writes (~every 2 seconds)
-    private var widgetUpdateCounter = 0
+
     
     private func setupBindings() {
         // Pre-warm haptic engines
@@ -176,30 +175,7 @@ class TransceiverViewModel: ObservableObject {
                             freqOffsetHz: self.audioManager.freqOffset,
                             lastCallsign: newCallsign
                         )
-                        // Immediately update widget on callsign decode
-                        let freqMHz = String(format: "%.3f", Double(self.reporter?.frequencyHz ?? 14_236_000) / 1_000_000)
-                        WidgetSharedState.update(
-                            isRunning: self.isRunning,
-                            syncState: newSyncState.rawValue,
-                            snr: newSNR,
-                            lastCallsign: newCallsign,
-                            frequencyMHz: freqMHz
-                        )
                     }
-                }
-                
-                // Periodic widget state update (~every 2 seconds)
-                self.widgetUpdateCounter += 1
-                if self.widgetUpdateCounter >= 13 {  // ~2s at 0.15s interval
-                    self.widgetUpdateCounter = 0
-                    let freqMHz = String(format: "%.3f", Double(self.reporter?.frequencyHz ?? 14_236_000) / 1_000_000)
-                    WidgetSharedState.update(
-                        isRunning: self.isRunning,
-                        syncState: newSyncState.rawValue,
-                        snr: newSNR,
-                        lastCallsign: self.decodedCallsign,
-                        frequencyMHz: freqMHz
-                    )
                 }
             }
         }
@@ -281,26 +257,16 @@ class TransceiverViewModel: ObservableObject {
                     freqOffsetHz: freqOffset,
                     lastCallsign: self.decodedCallsign
                 )
-                // Widget update
-                let freqMHz = String(format: "%.3f", Double(self.reporter?.frequencyHz ?? 14_236_000) / 1_000_000)
-                WidgetSharedState.update(
-                    isRunning: true,
-                    syncState: syncState,
-                    snr: snr,
-                    lastCallsign: self.decodedCallsign,
-                    frequencyMHz: freqMHz
-                )
             }
         }
         
         #if os(iOS)
         // Request extra time during background transition
         audioManager.beginBackgroundTask()
-        // Re-assert audio session to signal iOS we're still using audio.
-        // We do NOT switch audio mode — .measurement mode must stay to preserve
-        // modem signal quality. Background execution is maintained by the location
-        // background mode (UIBackgroundModes: location) instead.
-        audioManager.reassertAudioSession()
+        // Switch to .default mode via full deactivate/reactivate cycle.
+        // This is required for iOS to recognize the audio as background-worthy.
+        // The tap is removed and reinstalled with the new format.
+        audioManager.setBackgroundAudioMode(true)
         #endif
         
         bgLog("ViewModel: entered background mode (FFT off, timer stopped)")
@@ -316,6 +282,8 @@ class TransceiverViewModel: ObservableObject {
         #if os(iOS)
         // End background task if still active
         audioManager.endBackgroundTask()
+        // Restore .measurement mode for optimal modem quality
+        audioManager.setBackgroundAudioMode(false)
         #endif
         
         // Check if audio engine is still running after returning from background
@@ -324,7 +292,7 @@ class TransceiverViewModel: ObservableObject {
         audioManager.fftEnabled = powerManager?.fftEnabled ?? true
         // Restart the UI timer
         restartStatusTimer(interval: powerManager?.uiUpdateInterval ?? 0.15)
-        bgLog("ViewModel: exited background mode (settings restored, mode=measurement)")
+        bgLog("ViewModel: exited background mode (settings restored)")
     }
     
     // MARK: - Sync State Display

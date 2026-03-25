@@ -4,6 +4,7 @@ import Combine
 import Accelerate
 import SwiftData
 import CoreLocation
+import UserNotifications
 #if os(iOS)
 import UIKit
 #endif
@@ -176,7 +177,7 @@ class AudioManager: ObservableObject {
     /// after which iOS will keep the app alive via the audio background mode.
     func beginBackgroundTask() {
         guard backgroundTaskID == .invalid else { return }
-        backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "FreeDV-Audio") { [weak self] in
+        backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "RADEDecode-Audio") { [weak self] in
             self?.endBackgroundTask()
         }
         bgLog("Background task started (id=\(backgroundTaskID.rawValue))")
@@ -187,6 +188,27 @@ class AudioManager: ObservableObject {
         bgLog("Background task ended (id=\(backgroundTaskID.rawValue))")
         UIApplication.shared.endBackgroundTask(backgroundTaskID)
         backgroundTaskID = .invalid
+    }
+    
+    /// Request notification permission for background sync alerts.
+    func requestNotificationPermission() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            bgLog("Notification permission: \(granted)")
+        }
+    }
+    
+    /// Send a local notification when sync is gained in background.
+    private func sendBackgroundSyncNotification(snr: Float) {
+        let content = UNMutableNotificationContent()
+        content.title = "RADE Sync"
+        content.body = String(format: "Signal locked — SNR %+.1f dB", snr)
+        content.sound = .default
+        let request = UNNotificationRequest(
+            identifier: "bg-sync-\(Date().timeIntervalSince1970)",
+            content: content,
+            trigger: nil  // deliver immediately
+        )
+        UNUserNotificationCenter.current().add(request)
     }
     
     /// Re-assert the audio session when entering background.
@@ -236,13 +258,14 @@ class AudioManager: ObservableObject {
         
         bgLog("Switching audio mode from \(currentMode.rawValue) to \(newMode.rawValue)")
         
-        // Step 1: Stop the engine
+        // Step 1: Stop the engine and remove input tap
         let wasRunning = audioEngine.isRunning
         if wasRunning {
+            inputNode.removeTap(onBus: 0)
             audioEngine.stop()
         }
         
-        // Step 2: Deactivate session — required before changing mode
+        // Step 2: Deactivate session — REQUIRED for iOS to accept mode change
         do {
             try session.setActive(false)
             bgLog("Session deactivated for mode switch")
@@ -259,12 +282,7 @@ class AudioManager: ObservableObject {
             )
             bgLog("Category set with mode \(newMode.rawValue)")
         } catch {
-            bgLog("Failed to set category: \(error) — restoring \(currentMode.rawValue)")
-            try? session.setCategory(
-                .playAndRecord,
-                mode: currentMode,
-                options: [.allowBluetooth, .defaultToSpeaker]
-            )
+            bgLog("Failed to set category: \(error)")
         }
         
         // Step 4: Reactivate session
@@ -275,21 +293,55 @@ class AudioManager: ObservableObject {
             bgLog("Session reactivate failed: \(error)")
         }
         
-        // Step 5: Restart engine
+        // Step 5: Restart engine with reinstalled tap
         if wasRunning {
             do {
                 try audioEngine.start()
-                // CRITICAL: Re-disable voice processing after mode switch.
-                // .default mode re-enables echo cancellation & noise suppression,
-                // which completely destroys the RADE modem signal and prevents sync.
+                // Disable voice processing — .default mode enables echo
+                // cancellation which destroys the modem signal.
                 try inputNode.setVoiceProcessingEnabled(false)
+                
+                // Reinstall input tap with current format
+                let inputFormat = inputNode.outputFormat(forBus: 0)
+                bgLog("Input format after switch: \(inputFormat.sampleRate)Hz ch=\(inputFormat.channelCount)")
+                
+                // Rebuild converter for potentially changed format
+                if let monoFmt = AVAudioFormat(
+                    commonFormat: .pcmFormatFloat32,
+                    sampleRate: inputFormat.sampleRate,
+                    channels: 1,
+                    interleaved: true
+                ) {
+                    monoFloatFormat = monoFmt
+                    rxConverter = AVAudioConverter(from: monoFmt, to: modemFormat)
+                }
+                
+                inputNode.installTap(onBus: 0, bufferSize: 960,
+                                     format: inputFormat) { [weak self] buffer, time in
+                    self?.processRXInput(buffer: buffer)
+                }
+                
                 if !background {
                     applyFixedInputGain()
                 }
-                bgLog("Engine restarted after mode switch (running=\(audioEngine.isRunning), voiceProc=off)")
+                bgLog("Engine restarted with fresh tap (mode=\(session.mode.rawValue), voiceProc=off)")
             } catch {
                 bgLog("Failed to restart engine: \(error)")
             }
+        }
+        
+        // Debug: send notification to confirm background mode switch happened
+        if background {
+            let content = UNMutableNotificationContent()
+            content.title = "RADE Background"
+            content.body = "Audio engine restarted in background mode (engine=\(audioEngine.isRunning))"
+            content.sound = .default
+            let request = UNNotificationRequest(
+                identifier: "bg-enter-\(Date().timeIntervalSince1970)",
+                content: content,
+                trigger: nil
+            )
+            UNUserNotificationCenter.current().add(request)
         }
     }
     
@@ -488,6 +540,8 @@ class AudioManager: ObservableObject {
                     if !self.sessionActive {
                         if self.backgroundMode {
                             bgLog("Sync gained in background — starting session")
+                            // Debug: send local notification to confirm background decoding works
+                            self.sendBackgroundSyncNotification(snr: snr)
                         }
                         self.beginNewSubSession()
                     }
@@ -600,12 +654,15 @@ class AudioManager: ObservableObject {
     func startRX() {
         guard !isRunning else { return }
         
-        // Re-establish playAndRecord session in case another component
-        // (e.g. AudioFilePlayer) changed the category to playback-only.
+        // Request notification permission for background sync debug alerts
+        requestNotificationPermission()
+        
+        // Use .measurement mode for raw unprocessed audio, ideal for modem.
+        // Background survival is handled by switching to .default mode
+        // in setBackgroundAudioMode() when the app enters background.
         #if os(iOS)
         let session = AVAudioSession.sharedInstance()
-        let mode: AVAudioSession.Mode = backgroundMode ? .default : .measurement
-        try? session.setCategory(.playAndRecord, mode: mode,
+        try? session.setCategory(.playAndRecord, mode: .measurement,
                                   options: [.allowBluetooth, .defaultToSpeaker])
         try? session.setActive(true)
         applyFixedInputGain()

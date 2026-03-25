@@ -168,7 +168,7 @@ struct SettingsView: View {
                 }
             }
             
-            // GPS tracking
+            // GPS tracking & background location
             Section("GPS Tracking") {
                 Toggle("Track Location During RX", isOn: Binding(
                     get: { AudioManager.gpsTrackingEnabled },
@@ -177,6 +177,10 @@ struct SettingsView: View {
                 Text("Records your location when receiving signals. Useful for comparing reception at different locations.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                
+                if AudioManager.gpsTrackingEnabled {
+                    BackgroundLocationStatusView()
+                }
             }
             
             // Recording settings
@@ -199,6 +203,7 @@ struct SettingsView: View {
                 LabeledContent("Version", value: Bundle.main.shortVersion)
                 LabeledContent("License", value: "BSD-2-Clause")
                 Link("FreeDV Project", destination: URL(string: "https://freedv.org")!)
+                Link("Privacy Policy", destination: URL(string: "https://freedv.org/privacy")!)
             }
         }
         .navigationTitle("Settings")
@@ -480,6 +485,101 @@ class LocationHelper: NSObject, ObservableObject, CLLocationManagerDelegate {
         let sub2 = Character(UnicodeScalar(97 + min(subLat, 23))!)
         
         return String([f1, f2, s1, s2, sub1, sub2])
+    }
+}
+
+// MARK: - Background Location Status
+
+/// Shows location authorization status and guides the user to enable "Always" for background RX.
+struct BackgroundLocationStatusView: View {
+    @StateObject private var helper = BackgroundLocationHelper()
+    
+    var body: some View {
+        switch helper.authStatus {
+        case .authorizedAlways:
+            Label("Background reception enabled", systemImage: "checkmark.circle.fill")
+                .font(.caption)
+                .foregroundStyle(.green)
+            
+        case .authorizedWhenInUse:
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Background reception requires \"Always\" location", systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                Text("Open Settings → Location → select \"Always\" to keep receiving when the screen is off.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Button {
+                    if let url = URL(string: UIApplication.openSettingsURLString) {
+                        UIApplication.shared.open(url)
+                    }
+                } label: {
+                    Label("Open Settings", systemImage: "gear")
+                        .font(.caption.weight(.medium))
+                }
+            }
+            
+        case .denied, .restricted:
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Location access denied", systemImage: "xmark.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                Text("Open Settings to grant location access for background reception.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Button {
+                    if let url = URL(string: UIApplication.openSettingsURLString) {
+                        UIApplication.shared.open(url)
+                    }
+                } label: {
+                    Label("Open Settings", systemImage: "gear")
+                        .font(.caption.weight(.medium))
+                }
+            }
+            
+        case .notDetermined:
+            Button {
+                helper.requestAlways()
+            } label: {
+                Label("Enable Location Access", systemImage: "location")
+                    .font(.caption.weight(.medium))
+            }
+            
+        @unknown default:
+            EmptyView()
+        }
+    }
+}
+
+/// Monitors CLLocationManager authorization changes for the settings UI.
+class BackgroundLocationHelper: NSObject, ObservableObject, CLLocationManagerDelegate {
+    @Published var authStatus: CLAuthorizationStatus
+    
+    private let manager = CLLocationManager()
+    
+    override init() {
+        authStatus = CLLocationManager().authorizationStatus
+        super.init()
+        manager.delegate = self
+    }
+    
+    func requestWhenInUse() {
+        manager.requestWhenInUseAuthorization()
+    }
+    
+    func requestAlways() {
+        let status = manager.authorizationStatus
+        if status == .notDetermined {
+            manager.requestWhenInUseAuthorization()
+        } else if status == .authorizedWhenInUse {
+            manager.requestAlwaysAuthorization()
+        }
+    }
+    
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        DispatchQueue.main.async {
+            self.authStatus = manager.authorizationStatus
+        }
     }
 }
 

@@ -3,6 +3,25 @@ import SwiftUI
 /// Displays online FreeDV Reporter stations grouped by band.
 struct ReporterStationsView: View {
     var reporter: FreeDVReporter
+    @AppStorage("hiddenCallsigns") private var hiddenCallsignsData: Data = Data()
+    @State private var showReportAlert = false
+    @State private var reportCallsign = ""
+    
+    private var hiddenCallsigns: Set<String> {
+        (try? JSONDecoder().decode(Set<String>.self, from: hiddenCallsignsData)) ?? []
+    }
+    
+    private func hideStation(_ callsign: String) {
+        var hidden = hiddenCallsigns
+        hidden.insert(callsign.uppercased())
+        if let data = try? JSONEncoder().encode(hidden) {
+            hiddenCallsignsData = data
+        }
+    }
+    
+    private func unhideAll() {
+        hiddenCallsignsData = Data()
+    }
     
     var body: some View {
         NavigationStack {
@@ -11,6 +30,19 @@ struct ReporterStationsView: View {
                     Section {
                         ForEach(group.stations) { station in
                             StationRow(station: station)
+                                .contextMenu {
+                                    Button(role: .destructive) {
+                                        hideStation(station.callsign)
+                                    } label: {
+                                        Label("Hide Station", systemImage: "eye.slash")
+                                    }
+                                    Button {
+                                        reportCallsign = station.callsign
+                                        showReportAlert = true
+                                    } label: {
+                                        Label("Report Content", systemImage: "exclamationmark.bubble")
+                                    }
+                                }
                         }
                     } header: {
                         HStack {
@@ -33,6 +65,22 @@ struct ReporterStationsView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+                if !hiddenCallsigns.isEmpty {
+                    ToolbarItem(placement: .automatic) {
+                        Button("Unhide All") { unhideAll() }
+                            .font(.caption)
+                    }
+                }
+            }
+            .alert("Report Station", isPresented: $showReportAlert) {
+                Button("Send Report") {
+                    if let url = URL(string: "https://github.com/drowe67/freedv-gui/issues") {
+                        UIApplication.shared.open(url)
+                    }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Report \(reportCallsign) for objectionable content? This will open the FreeDV project issue tracker where the server administrators can take action.")
             }
             .overlay {
                 if reporter.stations.isEmpty {
@@ -63,7 +111,9 @@ struct ReporterStationsView: View {
     }
     
     var groupedByBand: [BandGroup] {
+        let hidden = hiddenCallsigns
         let allStations = Array(reporter.stations.values)
+            .filter { !hidden.contains($0.callsign.uppercased()) }
         var groups: [String: (order: Int, stations: [ReporterStation])] = [:]
         
         for station in allStations {
