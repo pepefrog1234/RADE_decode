@@ -28,6 +28,8 @@ class RADEWrapper {
     var onDecodedAudio: ((_ samples: UnsafePointer<Int16>?, _ count: Int32) -> Void)?
     var onStatusUpdate: ((_ status: RADERxStatus?) -> Void)?
     var onCallsignDecoded: ((_ callsign: String?) -> Void)?
+    var speechSynthesisEnabled = true
+    var deferredFeatureStorageEnabled = false
     var onModemFrameProcessed: ((_ snr: Float, _ freqOffset: Float, _ syncState: Int, _ nin: Int) -> Void)?
 
     init() {
@@ -39,6 +41,14 @@ class RADEWrapper {
     }
 
     func resetFargan() {
+        // No-op on simulator
+    }
+
+    func resetDeferredFeatures() {
+        // No-op on simulator
+    }
+
+    func synthesizeDeferredFeatures(batchFrames: Int = 24) {
         // No-op on simulator
     }
 
@@ -94,6 +104,8 @@ class RADEWrapper {
     private var farganPendingFeatures: [[Float]] = []
     /// Guard against overlapping FARGAN processing
     private var farganBusy = false
+    /// File-backed store for deferred feature synthesis.
+    private let deferredFeatureStore = DeferredFeatureStore()
 
     // Callbacks
 
@@ -101,6 +113,11 @@ class RADEWrapper {
     var onDecodedAudio: ((_ samples: UnsafePointer<Int16>?, _ count: Int32) -> Void)?
     var onStatusUpdate: ((_ status: RADERxStatus?) -> Void)?
     var onCallsignDecoded: ((_ callsign: String?) -> Void)?
+
+    /// Disable FARGAN synthesis in background to reduce CPU load.
+    var speechSynthesisEnabled = true
+    /// Store decoded feature frames to disk while in background.
+    var deferredFeatureStorageEnabled = false
     
     /// Called after each rade_rx() call with data for reception logging.
     /// Parameters: (snr, freqOffset, syncState, nin, hasEoo, callsign)
@@ -227,15 +244,32 @@ class RADEWrapper {
                 }
             }
 
-            // If we got valid features, dispatch to FARGAN queue for synthesis
+            // Handle decoded feature frames.
             if nFeatOut > 0 {
-                let nFrames = Int(nFeatOut) / Int(NB_TOTAL_FEATURES)
-                var frames: [[Float]] = []
-                for fi in 0..<nFrames {
-                    let offset = fi * Int(NB_TOTAL_FEATURES)
-                    frames.append(Array(featuresOut[offset..<offset + Int(NB_TOTAL_FEATURES)]))
+                let totalFeatures = Int(nFeatOut)
+                if deferredFeatureStorageEnabled && !speechSynthesisEnabled {
+                    // Background decode-only mode: write contiguous features directly.
+                    featuresOut.withUnsafeBufferPointer { buf in
+                        guard let base = buf.baseAddress else { return }
+                        deferredFeatureStore.appendRawFloats(base, count: totalFeatures)
+                    }
+                } else {
+                    let nFrames = totalFeatures / Int(NB_TOTAL_FEATURES)
+                    var frames: [[Float]] = []
+                    frames.reserveCapacity(nFrames)
+                    for fi in 0..<nFrames {
+                        let offset = fi * Int(NB_TOTAL_FEATURES)
+                        frames.append(Array(featuresOut[offset..<offset + Int(NB_TOTAL_FEATURES)]))
+                    }
+
+                    if deferredFeatureStorageEnabled {
+                        deferredFeatureStore.append(frames: frames)
+                    }
+
+                    if speechSynthesisEnabled {
+                        dispatchFargan(frames: frames)
+                    }
                 }
-                dispatchFargan(frames: frames)
             }
         }
     }
@@ -243,27 +277,44 @@ class RADEWrapper {
     /// Dispatch feature frames to FARGAN queue with overload protection.
     /// If FARGAN is still busy processing, drop new frames to prevent freeze.
     private func dispatchFargan(frames: [[Float]]) {
-        if farganBusy {
-            // FARGAN can't keep up - drop these frames
+        enqueueFargan(frames: frames, dropIfBusy: true)
+    }
+
+    private func enqueueDeferredFargan(frames: [[Float]]) {
+        enqueueFargan(frames: frames, dropIfBusy: false)
+    }
+
+    private func enqueueFargan(frames: [[Float]], dropIfBusy: Bool) {
+        guard !frames.isEmpty else { return }
+        if dropIfBusy && farganBusy {
             appLog("FARGAN: dropping \(frames.count) frames (overloaded)")
             return
         }
-        
+        farganPendingFeatures.append(contentsOf: frames)
+        runFarganQueueIfNeeded()
+    }
+
+    private func runFarganQueueIfNeeded() {
+        guard !farganBusy, !farganPendingFeatures.isEmpty else { return }
+
         farganBusy = true
-        let framesToProcess = frames
+        let framesToProcess = farganPendingFeatures
+        farganPendingFeatures.removeAll(keepingCapacity: true)
+
         farganQueue.async { [weak self] in
             guard let self = self else { return }
             let startTime = CFAbsoluteTimeGetCurrent()
-            
+
             for feat in framesToProcess {
                 self.farganProcessFeatureFrame(feat)
             }
-            
+
             let elapsed = CFAbsoluteTimeGetCurrent() - startTime
             if elapsed > 0.1 {
                 appLog("FARGAN: \(framesToProcess.count) frames took \(String(format: "%.0f", elapsed * 1000))ms")
             }
             self.farganBusy = false
+            self.runFarganQueueIfNeeded()
         }
     }
 
@@ -327,6 +378,19 @@ class RADEWrapper {
         }
         farganReady = false
         warmupCount = 0
+    }
+
+    /// Clear deferred feature file.
+    func resetDeferredFeatures() {
+        deferredFeatureStore.reset()
+    }
+
+    /// Drain deferred features from disk and enqueue for synthesis.
+    func synthesizeDeferredFeatures(batchFrames: Int = 24) {
+        deferredFeatureStore.drain(frameWidth: Int(NB_TOTAL_FEATURES),
+                                   batchFrames: batchFrames) { [weak self] frames in
+            self?.enqueueDeferredFargan(frames: frames)
+        }
     }
 
     /// Clear accumulated RX input samples so stale data doesn't carry over between sessions.

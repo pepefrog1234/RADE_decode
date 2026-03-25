@@ -21,8 +21,8 @@ class ReceptionLogger {
     /// At ~8 frames/sec, 4 frames ≈ 0.5 seconds — filters only very brief false syncs.
     private let minSyncedFrames = 4
     
-    init(modelContext: ModelContext) {
-        self.modelContext = modelContext
+    init(modelContainer: ModelContainer) {
+        self.modelContext = ModelContext(modelContainer)
     }
     
     // MARK: - Session Lifecycle

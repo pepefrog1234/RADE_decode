@@ -60,6 +60,10 @@ class TransceiverViewModel: ObservableObject {
     
     // Recording state
     @Published var isRecording = false
+
+    // Background decode health indicator
+    @Published var backgroundHealthText: String = ""
+    @Published var backgroundHealthIsHealthy: Bool = false
     
     private var statusTimer: Timer?
     private let maxWaterfallRows = 100
@@ -68,6 +72,7 @@ class TransceiverViewModel: ObservableObject {
     private var isProcessingTick = false
 
     private var backgroundObservers: [Any] = []
+    private var backgroundEnterTime: Date?
     
     init() {
         setupBindings()
@@ -192,6 +197,12 @@ class TransceiverViewModel: ObservableObject {
     }
     
     func startTransceiver() {
+        backgroundHealthText = ""
+        backgroundHealthIsHealthy = false
+        backgroundEnterTime = nil
+        audioManager.resetBackgroundHeartbeat()
+        audioManager.resetDeferredFeatures()
+
         audioManager.startRX()
         // Start Live Activity with current reporter frequency
         let freqMHz = String(format: "%.3f", Double(reporter?.frequencyHz ?? 14_236_000) / 1_000_000)
@@ -201,6 +212,11 @@ class TransceiverViewModel: ObservableObject {
     func stopTransceiver() {
         audioManager.stop()
         liveActivity.endActivity()
+
+        backgroundHealthText = ""
+        backgroundHealthIsHealthy = false
+        backgroundEnterTime = nil
+        audioManager.resetBackgroundHeartbeat()
     }
     
     /// Restart the status polling timer with a new interval (for power profile changes).
@@ -235,38 +251,45 @@ class TransceiverViewModel: ObservableObject {
     
     private func enterBackground() {
         isInBackground = true
+
+        if isRunning {
+            backgroundEnterTime = Date()
+            audioManager.resetBackgroundHeartbeat()
+            backgroundHealthText = "Background monitoring..."
+            backgroundHealthIsHealthy = false
+        }
+
         // Disable FFT and waterfall — no one can see them in background
         audioManager.fftEnabled = false
         // Tell AudioManager and LogManager to skip non-essential main thread dispatches
+        // Background strategy: decode + store feature frames only (no synthesis).
         audioManager.backgroundMode = true
+        audioManager.setBackgroundDecodeOnly(true)
+        audioManager.setDeferredFeatureStorageEnabled(true)
         LogManager.shared.backgroundMode = true
         // Stop the UI timer entirely — no SwiftUI updates needed in background.
         // Live Activity updates come from AudioManager's background callback instead.
         statusTimer?.invalidate()
         statusTimer = nil
         
-        // Set up lightweight background callback for Live Activity
-        audioManager.onBackgroundStatusUpdate = { [weak self] syncState, snr, freqOffset in
-            guard let self = self else { return }
-            // Dispatch to main actor for Live Activity (very lightweight, ~every 5s)
-            Task { @MainActor [weak self] in
-                guard let self = self else { return }
-                self.liveActivity.updateActivity(
-                    syncState: syncState,
-                    snr: snr,
-                    freqOffsetHz: freqOffset,
-                    lastCallsign: self.decodedCallsign
-                )
-            }
-        }
-        
+        // Disable non-essential background callbacks.
+        // Keep background execution focused on decoding + logging only.
+        audioManager.onBackgroundStatusUpdate = nil
+
         #if os(iOS)
-        // Request extra time during background transition
+        // Request short transition time, but keep the current audio mode.
+        // On some devices/routes, switching mode in background fails with 560557684
+        // and leaves the engine dead until foreground.
         audioManager.beginBackgroundTask()
-        // Switch to .default mode via full deactivate/reactivate cycle.
-        // This is required for iOS to recognize the audio as background-worthy.
-        // The tap is removed and reinstalled with the new format.
-        audioManager.setBackgroundAudioMode(true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.audioManager.reassertAudioSession()
+            self?.audioManager.checkEngineHealth()
+        }
+        // End background task promptly; persistent background runtime should come
+        // from audio background mode, not a long-lived UIApplication task.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) { [weak self] in
+            self?.audioManager.endBackgroundTask()
+        }
         #endif
         
         bgLog("ViewModel: entered background mode (FFT off, timer stopped)")
@@ -274,17 +297,43 @@ class TransceiverViewModel: ObservableObject {
     
     private func exitBackground() {
         isInBackground = false
+
+        if let enterTime = backgroundEnterTime {
+            let elapsed = Int(Date().timeIntervalSince(enterTime))
+            let heartbeat = audioManager.backgroundHeartbeatSnapshot()
+            if heartbeat.count > 0, let last = heartbeat.lastDate {
+                let lag = Int(Date().timeIntervalSince(last))
+                backgroundHealthText = "BG decode OK · \(heartbeat.count) updates in \(elapsed)s (last \(lag)s ago)"
+                backgroundHealthIsHealthy = true
+            } else if heartbeat.rxChunkCount > 0 {
+                let lag = heartbeat.rxChunkLastDate.map { Int(Date().timeIntervalSince($0)) } ?? -1
+                if lag >= 0 {
+                    backgroundHealthText = "BG audio active, but no decode heartbeat · chunks \(heartbeat.rxChunkCount), last \(lag)s ago"
+                } else {
+                    backgroundHealthText = "BG audio active, but no decode heartbeat · chunks \(heartbeat.rxChunkCount)"
+                }
+                backgroundHealthIsHealthy = false
+            } else {
+                backgroundHealthText = "BG decode not observed · 0 updates in \(elapsed)s"
+                backgroundHealthIsHealthy = false
+            }
+        }
+
         // Remove background callback
         audioManager.onBackgroundStatusUpdate = nil
         audioManager.backgroundMode = false
+        audioManager.setDeferredFeatureStorageEnabled(false)
+        audioManager.setBackgroundDecodeOnly(false)
         LogManager.shared.backgroundMode = false
+
+        // Foreground: synthesize deferred background features into session audio log.
+        audioManager.synthesizeDeferredFeatures()
         
         #if os(iOS)
-        // End background task if still active
+        // Ensure no transition task is left running.
         audioManager.endBackgroundTask()
-        // Restore .measurement mode for optimal modem quality
-        audioManager.setBackgroundAudioMode(false)
         #endif
+        
         
         // Check if audio engine is still running after returning from background
         audioManager.checkEngineHealth()

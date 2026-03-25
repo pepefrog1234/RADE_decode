@@ -4,7 +4,6 @@ import Combine
 import Accelerate
 import SwiftData
 import CoreLocation
-import UserNotifications
 #if os(iOS)
 import UIKit
 #endif
@@ -65,6 +64,14 @@ class AudioManager: ObservableObject {
     
     /// Counter to throttle background status updates (~every 5 seconds)
     private var backgroundUpdateCounter = 0
+    /// Background heartbeat count used for diagnostics in the UI.
+    private var backgroundHeartbeatCount = 0
+    /// Last background heartbeat timestamp.
+    private var backgroundHeartbeatLastDate: Date?
+    /// Count of RX chunks processed in background (pre-heartbeat diagnostic).
+    private var backgroundRxChunkCount = 0
+    /// Last RX chunk timestamp in background.
+    private var backgroundRxChunkLastDate: Date?
     
     // Decoded callsign from EOO
     @Published var decodedCallsign: String = ""
@@ -114,6 +121,15 @@ class AudioManager: ObservableObject {
                                                  qos: .userInitiated)
     /// Separate queue for FFT so it's not blocked by RADE neural network processing.
     private let fftQueue = DispatchQueue(label: "com.freedv.fft", qos: .default)
+    /// Backpressure gate for RX processing queue to prevent unbounded task buildup.
+    private let processingBackpressureLock = NSLock()
+    private var pendingProcessingChunks = 0
+    private let maxPendingProcessingChunks = 6
+    private var droppedProcessingChunks = 0
+    /// Background decode stride: process 1 chunk every N converted chunks.
+    /// Reduces sustained background CPU load to avoid jetsam/termination.
+    private let backgroundDecodeStride = 2
+    private var backgroundChunkCounter = 0
     
     /// Flag to signal processingQueue to skip work during shutdown
     private var shouldProcess = false
@@ -123,6 +139,9 @@ class AudioManager: ObservableObject {
     
     /// Hardware sample rate, stored for sub-session creation
     private var currentSampleRate: Int = 48000
+
+    /// Track whether input tap is currently installed.
+    private var isInputTapInstalled = false
     
     /// Grace period timer for sync loss — brief sync drops don't end the session.
     /// Real radio signals often have momentary sync drops due to fading.
@@ -160,16 +179,59 @@ class AudioManager: ObservableObject {
     }
     
     /// Configure reception logger with a SwiftData ModelContainer.
-    /// Call this after init, once the container is available.
-    /// Idempotent — won't recreate if already configured.
+    /// Logger/context are created on processingQueue so all SwiftData access
+    /// stays on the same execution context used by RX processing.
     func configureLogger(modelContainer: ModelContainer) {
-        guard receptionLogger == nil else { return }
-        let context = ModelContext(modelContainer)
-        receptionLogger = ReceptionLogger(modelContext: context)
+        processingQueue.sync {
+            guard receptionLogger == nil else { return }
+            receptionLogger = ReceptionLogger(modelContainer: modelContainer)
+        }
         appLog("ReceptionLogger: configured")
     }
     
     // MARK: - Background Task
+
+    func setBackgroundDecodeOnly(_ enabled: Bool) {
+        radeWrapper.speechSynthesisEnabled = !enabled
+    }
+
+    func setDeferredFeatureStorageEnabled(_ enabled: Bool) {
+        radeWrapper.deferredFeatureStorageEnabled = enabled
+    }
+
+    func resetDeferredFeatures() {
+        radeWrapper.resetDeferredFeatures()
+    }
+
+    func synthesizeDeferredFeatures() {
+        processingQueue.async { [weak self] in
+            self?.radeWrapper.synthesizeDeferredFeatures()
+        }
+    }
+
+    func resetBackgroundHeartbeat() {
+        processingQueue.sync {
+            backgroundUpdateCounter = 0
+            backgroundHeartbeatCount = 0
+            backgroundHeartbeatLastDate = nil
+            backgroundRxChunkCount = 0
+            backgroundRxChunkLastDate = nil
+        }
+    }
+
+    func backgroundHeartbeatSnapshot() -> (count: Int, lastDate: Date?, rxChunkCount: Int, rxChunkLastDate: Date?) {
+        var count = 0
+        var lastDate: Date?
+        var rxChunkCount = 0
+        var rxChunkLastDate: Date?
+        processingQueue.sync {
+            count = backgroundHeartbeatCount
+            lastDate = backgroundHeartbeatLastDate
+            rxChunkCount = backgroundRxChunkCount
+            rxChunkLastDate = backgroundRxChunkLastDate
+        }
+        return (count, lastDate, rxChunkCount, rxChunkLastDate)
+    }
     
     #if os(iOS)
     /// Request extra time from iOS during the background transition.
@@ -188,27 +250,6 @@ class AudioManager: ObservableObject {
         bgLog("Background task ended (id=\(backgroundTaskID.rawValue))")
         UIApplication.shared.endBackgroundTask(backgroundTaskID)
         backgroundTaskID = .invalid
-    }
-    
-    /// Request notification permission for background sync alerts.
-    func requestNotificationPermission() {
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { granted, _ in
-            bgLog("Notification permission: \(granted)")
-        }
-    }
-    
-    /// Send a local notification when sync is gained in background.
-    private func sendBackgroundSyncNotification(snr: Float) {
-        let content = UNMutableNotificationContent()
-        content.title = "RADE Sync"
-        content.body = String(format: "Signal locked — SNR %+.1f dB", snr)
-        content.sound = .default
-        let request = UNNotificationRequest(
-            identifier: "bg-sync-\(Date().timeIntervalSince1970)",
-            content: content,
-            trigger: nil  // deliver immediately
-        )
-        UNUserNotificationCenter.current().add(request)
     }
     
     /// Re-assert the audio session when entering background.
@@ -261,7 +302,7 @@ class AudioManager: ObservableObject {
         // Step 1: Stop the engine and remove input tap
         let wasRunning = audioEngine.isRunning
         if wasRunning {
-            inputNode.removeTap(onBus: 0)
+            removeInputTapIfInstalled()
             audioEngine.stop()
         }
         
@@ -280,7 +321,12 @@ class AudioManager: ObservableObject {
                 mode: newMode,
                 options: [.allowBluetooth, .defaultToSpeaker]
             )
-            bgLog("Category set with mode \(newMode.rawValue)")
+            // Re-apply preferred audio parameters after category/mode switch.
+            // iOS may inflate IO buffer duration in background, which can make
+            // callback cadence too sparse for modem decoding.
+            try session.setPreferredIOBufferDuration(0.04)
+            try session.setPreferredSampleRate(48000)
+            bgLog("Category set with mode \(newMode.rawValue), ioBuffer=\(session.ioBufferDuration), preferredSR=\(session.preferredSampleRate)")
         } catch {
             bgLog("Failed to set category: \(error)")
         }
@@ -297,74 +343,60 @@ class AudioManager: ObservableObject {
         if wasRunning {
             do {
                 try audioEngine.start()
-                // Disable voice processing — .default mode enables echo
-                // cancellation which destroys the modem signal.
-                try inputNode.setVoiceProcessingEnabled(false)
-                
+
+                // Disable voice processing — .default mode enables echo cancellation
+                // which destroys the modem signal. If this fails, continue anyway.
+                do {
+                    try inputNode.setVoiceProcessingEnabled(false)
+                } catch {
+                    bgLog("Failed to disable voice processing after mode switch: \(error)")
+                }
+
                 // Reinstall input tap with current format
                 let inputFormat = inputNode.outputFormat(forBus: 0)
                 bgLog("Input format after switch: \(inputFormat.sampleRate)Hz ch=\(inputFormat.channelCount)")
-                
-                // Rebuild converter for potentially changed format
-                if let monoFmt = AVAudioFormat(
-                    commonFormat: .pcmFormatFloat32,
-                    sampleRate: inputFormat.sampleRate,
-                    channels: 1,
-                    interleaved: true
-                ) {
-                    monoFloatFormat = monoFmt
-                    rxConverter = AVAudioConverter(from: monoFmt, to: modemFormat)
-                }
-                
-                inputNode.installTap(onBus: 0, bufferSize: 960,
-                                     format: inputFormat) { [weak self] buffer, time in
-                    self?.processRXInput(buffer: buffer)
-                }
-                
+
+                // Rebuild converter and input tap for potentially changed format
+                configureInputConverter(for: inputFormat)
+                installInputTapIfNeeded(with: inputFormat)
+
                 if !background {
                     applyFixedInputGain()
                 }
-                bgLog("Engine restarted with fresh tap (mode=\(session.mode.rawValue), voiceProc=off)")
+                bgLog("Engine restarted with fresh tap (mode=\(session.mode.rawValue))")
             } catch {
                 bgLog("Failed to restart engine: \(error)")
             }
         }
         
-        // Debug: send notification to confirm background mode switch happened
-        if background {
-            let content = UNMutableNotificationContent()
-            content.title = "RADE Background"
-            content.body = "Audio engine restarted in background mode (engine=\(audioEngine.isRunning))"
-            content.sound = .default
-            let request = UNNotificationRequest(
-                identifier: "bg-enter-\(Date().timeIntervalSince1970)",
-                content: content,
-                trigger: nil
-            )
-            UNUserNotificationCenter.current().add(request)
-        }
     }
     
     /// Check if the audio engine is still running and restart if needed.
     /// Call this periodically or after interruptions.
     func checkEngineHealth() {
         guard isRunning else { return }
-        if audioEngine.isRunning {
-            return
+
+        if !audioEngine.isRunning {
+            bgLog("Audio engine stalled — attempting restart")
+            do {
+                #if os(iOS)
+                try AVAudioSession.sharedInstance().setActive(true)
+                #endif
+                try audioEngine.start()
+                #if os(iOS)
+                applyFixedInputGain()
+                #endif
+                bgLog("Audio engine restarted successfully")
+            } catch {
+                appLog("Audio engine restart failed: \(error)")
+                return
+            }
         }
-        bgLog("Audio engine stalled — attempting restart")
-        do {
-            #if os(iOS)
-            try AVAudioSession.sharedInstance().setActive(true)
-            #endif
-            try audioEngine.start()
-            #if os(iOS)
-            applyFixedInputGain()
-            #endif
-            bgLog("Audio engine restarted successfully")
-        } catch {
-            appLog("Audio engine restart failed: \(error)")
-        }
+
+        // Ensure the input converter/tap are present after lifecycle transitions.
+        let inputFormat = inputNode.outputFormat(forBus: 0)
+        configureInputConverter(for: inputFormat)
+        installInputTapIfNeeded(with: inputFormat)
     }
     
     /// Start a periodic health check timer that runs on a background queue.
@@ -377,6 +409,13 @@ class AudioManager: ObservableObject {
         timer.setEventHandler { [weak self] in
             guard let self = self, self.isRunning else { return }
             let engineRunning = self.audioEngine.isRunning
+            if self.backgroundMode {
+                self.processingBackpressureLock.lock()
+                let pending = self.pendingProcessingChunks
+                let dropped = self.droppedProcessingChunks
+                self.processingBackpressureLock.unlock()
+                bgLog("Health tick: engine=\(engineRunning) pending=\(pending) dropped=\(dropped)")
+            }
             if !engineRunning {
                 bgLog("Health check: engine NOT running — restarting")
                 self.checkEngineHealth()
@@ -401,7 +440,7 @@ class AudioManager: ObservableObject {
         do {
             try session.setCategory(
                 .playAndRecord,
-                mode: .measurement,
+                mode: .default,
                 options: [
                     .allowBluetooth,
                     .defaultToSpeaker
@@ -480,11 +519,14 @@ class AudioManager: ObservableObject {
     // MARK: - RADE Callbacks
     
     private func setupRADECallbacks() {
-        // Play decoded speech when received + record to WAV
+        // Decode success path: always write synthesized speech to WAV log.
+        // In background we skip speaker playback but keep session audio evidence.
         radeWrapper.onDecodedAudio = { [weak self] samples, count in
-            guard let samples = samples else { return }
-            self?.wavRecorder?.writeSamples(samples, count: Int(count))
-            self?.playDecodedAudio(samples: samples, count: Int(count))
+            guard let self = self, let samples = samples else { return }
+            self.wavRecorder?.writeSamples(samples, count: Int(count))
+            if !self.backgroundMode {
+                self.playDecodedAudio(samples: samples, count: Int(count))
+            }
         }
         
         // Status updates — skip main thread dispatch in background to avoid
@@ -540,8 +582,6 @@ class AudioManager: ObservableObject {
                     if !self.sessionActive {
                         if self.backgroundMode {
                             bgLog("Sync gained in background — starting session")
-                            // Debug: send local notification to confirm background decoding works
-                            self.sendBackgroundSyncNotification(snr: snr)
                         }
                         self.beginNewSubSession()
                     }
@@ -560,13 +600,15 @@ class AudioManager: ObservableObject {
                 }
             }
             
-            // Record snapshot only during SYNC
-            if isSynced,
+            // Record high-rate snapshots only in foreground.
+            // In background this object stream can cause memory pressure/jetsam.
+            if !self.backgroundMode,
+               isSynced,
                let logger = self.receptionLogger,
                let startTime = self.sessionStartTime {
                 let now = Date()
                 let offsetMs = Int64(now.timeIntervalSince(startTime) * 1000)
-                
+
                 let snapshot = SignalSnapshot(
                     timestamp: now,
                     offsetMs: offsetMs,
@@ -589,6 +631,8 @@ class AudioManager: ObservableObject {
                 self.backgroundUpdateCounter += 1
                 if self.backgroundUpdateCounter >= 42 {
                     self.backgroundUpdateCounter = 0
+                    self.backgroundHeartbeatCount += 1
+                    self.backgroundHeartbeatLastDate = Date()
                     self.onBackgroundStatusUpdate?(syncState, snr, freqOffset)
                 }
             }
@@ -650,19 +694,44 @@ class AudioManager: ObservableObject {
     }
     
     // MARK: - RX (Receive Mode)
+
+    private func configureInputConverter(for inputFormat: AVAudioFormat) {
+        if let monoFmt = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: inputFormat.sampleRate,
+            channels: 1,
+            interleaved: true
+        ) {
+            monoFloatFormat = monoFmt
+            rxConverter = AVAudioConverter(from: monoFmt, to: modemFormat)
+        }
+    }
+
+    private func installInputTapIfNeeded(with inputFormat: AVAudioFormat) {
+        guard !isInputTapInstalled else { return }
+        inputNode.installTap(onBus: 0, bufferSize: 960,
+                            format: inputFormat) { [weak self] buffer, _ in
+            self?.processRXInput(buffer: buffer)
+        }
+        isInputTapInstalled = true
+    }
+
+    private func removeInputTapIfInstalled() {
+        guard isInputTapInstalled else { return }
+        inputNode.removeTap(onBus: 0)
+        isInputTapInstalled = false
+    }
     
     func startRX() {
         guard !isRunning else { return }
         
-        // Request notification permission for background sync debug alerts
-        requestNotificationPermission()
+        // Use .default mode for better background compatibility on iOS.
+        // Voice processing is disabled on the input node below.
+        resetDeferredFeatures()
         
-        // Use .measurement mode for raw unprocessed audio, ideal for modem.
-        // Background survival is handled by switching to .default mode
-        // in setBackgroundAudioMode() when the app enters background.
         #if os(iOS)
         let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playAndRecord, mode: .measurement,
+        try? session.setCategory(.playAndRecord, mode: .default,
                                   options: [.allowBluetooth, .defaultToSpeaker])
         try? session.setActive(true)
         applyFixedInputGain()
@@ -714,27 +783,20 @@ class AudioManager: ObservableObject {
         appLog("Audio input format: \(inputFormat)")
         appLog("Input channels: \(inputFormat.channelCount), sampleRate: \(inputFormat.sampleRate)")
         
-        // Create mono float format at input sample rate for stereo→mono downmix
-        monoFloatFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: inputFormat.sampleRate,
-            channels: 1,
-            interleaved: true
-        )
-        
         // Set up RX sample rate converter from mono float → 8kHz int16
         // This avoids a complex multi-step conversion (stereo→mono + 48kHz→8kHz + float→int16)
+        configureInputConverter(for: inputFormat)
         if let monoFmt = monoFloatFormat {
-            rxConverter = AVAudioConverter(from: monoFmt, to: modemFormat)
             appLog("RX converter: mono \(monoFmt.sampleRate)Hz Float32 → \(modemFormat.sampleRate)Hz Int16")
         }
-        
+
         shouldProcess = true
-        
-        inputNode.installTap(onBus: 0, bufferSize: 960,
-                            format: inputFormat) { [weak self] buffer, time in
-            self?.processRXInput(buffer: buffer)
-        }
+        processingBackpressureLock.lock()
+        pendingProcessingChunks = 0
+        droppedProcessingChunks = 0
+        backgroundChunkCounter = 0
+        processingBackpressureLock.unlock()
+        installInputTapIfNeeded(with: inputFormat)
         
         do {
             try audioEngine.start()
@@ -764,12 +826,18 @@ class AudioManager: ObservableObject {
     func stop() {
         // Signal processingQueue to skip pending work items immediately
         shouldProcess = false
+        setDeferredFeatureStorageEnabled(false)
+        processingBackpressureLock.lock()
+        pendingProcessingChunks = 0
+        droppedProcessingChunks = 0
+        backgroundChunkCounter = 0
+        processingBackpressureLock.unlock()
         
         // Stop health monitoring
         stopHealthCheckTimer()
-        
-        inputNode.removeTap(onBus: 0)
-        
+
+        removeInputTapIfInstalled()
+
         audioEngine.stop()
         
         // Detach source node
@@ -933,15 +1001,47 @@ class AudioManager: ObservableObject {
             }
         }
         
-        // Copy samples off the audio thread for RADE processing and FFT
+        // RADE processing (may take 10-50ms per chunk due to neural network).
+        // Apply queue backpressure so background does not accumulate unlimited chunks.
+        var shouldEnqueue = false
+        processingBackpressureLock.lock()
+        if backgroundMode {
+            backgroundChunkCounter += 1
+            if backgroundChunkCounter % backgroundDecodeStride != 0 {
+                processingBackpressureLock.unlock()
+                return
+            }
+        }
+        if pendingProcessingChunks < maxPendingProcessingChunks {
+            pendingProcessingChunks += 1
+            shouldEnqueue = true
+        } else {
+            droppedProcessingChunks += 1
+            if droppedProcessingChunks % 100 == 0 {
+                appLog("AudioManager: dropped \(droppedProcessingChunks) RX chunks (backpressure)")
+            }
+        }
+        processingBackpressureLock.unlock()
+
+        guard shouldEnqueue else { return }
+
+        // Copy samples off the audio thread only after queue admission succeeds.
         let samplesCopy = Array(UnsafeBufferPointer(start: samples, count: convertedCount))
-        
-        // RADE processing (may take 10-50ms per chunk due to neural network)
-        processingQueue.async { [weak self] in
-            guard let self = self, self.shouldProcess else { return }
+
+        processingQueue.async { [self] in
+            defer {
+                processingBackpressureLock.lock()
+                pendingProcessingChunks = max(0, pendingProcessingChunks - 1)
+                processingBackpressureLock.unlock()
+            }
+            guard shouldProcess else { return }
+            if backgroundMode {
+                backgroundRxChunkCount += 1
+                backgroundRxChunkLastDate = Date()
+            }
             samplesCopy.withUnsafeBufferPointer { buf in
                 guard let ptr = buf.baseAddress else { return }
-                self.radeWrapper.rxProcessInputSamples(ptr, count: Int32(convertedCount))
+                radeWrapper.rxProcessInputSamples(ptr, count: Int32(convertedCount))
             }
         }
         

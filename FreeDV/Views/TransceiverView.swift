@@ -268,7 +268,7 @@ struct BottomControls: View {
                 .lineLimit(1)
                 
                 if viewModel.isRunning {
-                    BackgroundHintLabel()
+                    BackgroundHintLabel(viewModel: viewModel)
                 }
             }
         }
@@ -279,17 +279,27 @@ struct BottomControls: View {
 
 /// Shows a small hint below the start button about background reception status.
 struct BackgroundHintLabel: View {
+    @ObservedObject var viewModel: TransceiverViewModel
     private let authStatus = CLLocationManager().authorizationStatus
     
     var body: some View {
-        if authStatus == .authorizedAlways {
-            Text("Continues in background")
-                .font(.system(size: 9))
-                .foregroundStyle(Color.gray.opacity(0.35))
-        } else {
-            Text("Enable \"Always\" location in Settings for background RX")
-                .font(.system(size: 9))
-                .foregroundStyle(Color.orange.opacity(0.6))
+        VStack(spacing: 2) {
+            if authStatus == .authorizedAlways {
+                Text("Continues in background")
+                    .font(.system(size: 9))
+                    .foregroundStyle(Color.gray.opacity(0.35))
+            } else {
+                Text("Enable \"Always\" location in Settings for background RX")
+                    .font(.system(size: 9))
+                    .foregroundStyle(Color.orange.opacity(0.6))
+            }
+
+            if !viewModel.backgroundHealthText.isEmpty {
+                Text(viewModel.backgroundHealthText)
+                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .foregroundStyle(viewModel.backgroundHealthIsHealthy ? .green : .orange)
+                    .lineLimit(1)
+            }
         }
     }
 }

@@ -45,6 +45,12 @@ class LogManager: ObservableObject {
     
     /// Add a log message (thread-safe, updates UI on main thread)
     func log(_ message: String) {
+        // In background, keep only explicit background lifecycle logs.
+        // This avoids heavy I/O from high-frequency DSP diagnostics.
+        if backgroundMode && !message.hasPrefix("[BG]") {
+            return
+        }
+
         let timestamp = Self.timeFormatter.string(from: Date())
         let entry = "[\(timestamp)] \(message)"
         
@@ -55,7 +61,6 @@ class LogManager: ObservableObject {
         queue.async {
             if let data = (entry + "\n").data(using: .utf8) {
                 self.fileHandle?.write(data)
-                self.fileHandle?.synchronizeFile()  // flush to disk immediately
             }
         }
         

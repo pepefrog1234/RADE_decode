@@ -281,10 +281,7 @@ class OnboardingLocationHelper: NSObject, ObservableObject, CLLocationManagerDel
     }
     
     /// Request location authorization.
-    /// Uses requestAlwaysAuthorization() so iOS grants "provisional Always",
-    /// which is required for reliable background execution. Even if the user
-    /// selects "While Using", iOS grants provisional Always access that
-    /// keeps background location updates working.
+    /// "Always" is required for reliable background location updates.
     func requestAuthorization() {
         manager.requestAlwaysAuthorization()
     }
