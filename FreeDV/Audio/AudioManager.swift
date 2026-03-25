@@ -125,10 +125,10 @@ class AudioManager: ObservableObject {
     private let processingBackpressureLock = NSLock()
     private var pendingProcessingChunks = 0
     private let maxPendingProcessingChunks = 6
+    private let maxPendingProcessingChunksInBackground = 2
     private var droppedProcessingChunks = 0
-    /// Background decode stride: process 1 chunk every N converted chunks.
-    /// Reduces sustained background CPU load to avoid jetsam/termination.
-    private let backgroundDecodeStride = 2
+    /// Background decode base stride. Adaptive logic raises this under load.
+    private let backgroundDecodeBaseStride = 1
     private var backgroundChunkCounter = 0
     
     /// Flag to signal processingQueue to skip work during shutdown
@@ -414,7 +414,15 @@ class AudioManager: ObservableObject {
                 let pending = self.pendingProcessingChunks
                 let dropped = self.droppedProcessingChunks
                 self.processingBackpressureLock.unlock()
-                bgLog("Health tick: engine=\(engineRunning) pending=\(pending) dropped=\(dropped)")
+                let loadLevel: Int
+                if pending >= 5 {
+                    loadLevel = 3
+                } else if pending >= 3 {
+                    loadLevel = 2
+                } else {
+                    loadLevel = 1
+                }
+                bgLog("Health tick: engine=\(engineRunning) pending=\(pending) dropped=\(dropped) load=\(loadLevel)")
             }
             if !engineRunning {
                 bgLog("Health check: engine NOT running — restarting")
@@ -1005,14 +1013,26 @@ class AudioManager: ObservableObject {
         // Apply queue backpressure so background does not accumulate unlimited chunks.
         var shouldEnqueue = false
         processingBackpressureLock.lock()
+        var effectiveMaxPending = maxPendingProcessingChunks
         if backgroundMode {
+            effectiveMaxPending = maxPendingProcessingChunksInBackground
+            let adaptiveStride: Int
+            if pendingProcessingChunks >= 2 {
+                adaptiveStride = 6
+            } else if pendingProcessingChunks >= 1 {
+                adaptiveStride = 3
+            } else if pendingProcessingChunks >= 0 {
+                adaptiveStride = 2
+            } else {
+                adaptiveStride = backgroundDecodeBaseStride
+            }
             backgroundChunkCounter += 1
-            if backgroundChunkCounter % backgroundDecodeStride != 0 {
+            if backgroundChunkCounter % adaptiveStride != 0 {
                 processingBackpressureLock.unlock()
                 return
             }
         }
-        if pendingProcessingChunks < maxPendingProcessingChunks {
+        if pendingProcessingChunks < effectiveMaxPending {
             pendingProcessingChunks += 1
             shouldEnqueue = true
         } else {
