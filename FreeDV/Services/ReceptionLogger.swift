@@ -71,9 +71,13 @@ class ReceptionLogger {
             session.avgSNR = snrSum / Float(snrCount)
         }
         
-        // Discard session if too few synced frames (likely false sync),
-        // but keep it if at least one callsign was decoded.
-        if session.syncedFrames < minSyncedFrames && callsignEventBuffer.isEmpty {
+        // Discard session if too few synced frames (likely false sync).
+        // Keep sessions with callsign or decoded audio evidence.
+        let hasDecodedAudio = session.audioFileSize > 44
+            || (session.audioFilename != nil && session.audioFileSize > 0)
+        if session.syncedFrames < minSyncedFrames
+            && callsignEventBuffer.isEmpty
+            && !hasDecodedAudio {
             appLog("ReceptionLogger: session discarded (syncedFrames=\(session.syncedFrames) < \(minSyncedFrames), no callsign)")
             discardSession()
             return
