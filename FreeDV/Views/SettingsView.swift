@@ -192,6 +192,9 @@ struct SettingsView: View {
                 Text("This app includes third-party components under their respective licenses.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Text("Please use TestFlight feedback to report issues. If you are willing, include your email so we can follow up.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Link("FreeDV Project", destination: URL(string: "https://freedv.org")!)
                 Link("Privacy Policy", destination: URL(string: "https://freedv.org/privacy")!)
             }

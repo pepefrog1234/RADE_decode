@@ -99,6 +99,22 @@ class TransceiverViewModel: ObservableObject {
         setupBindings()
         observeAppLifecycle()
     }
+
+    @MainActor deinit {
+        // Ensure timer/observers/tasks are torn down deterministically.
+        statusTimer?.invalidate()
+        statusTimer = nil
+        callsignDismissTask?.cancel()
+        callsignDismissTask = nil
+        for observer in backgroundObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        backgroundObservers.removeAll()
+
+        // Stop runtime side effects owned by this VM.
+        audioManager.onBackgroundStatusUpdate = nil
+        audioManager.stop()
+    }
     
     /// Configure the reception logger with a ModelContainer.
     /// Call this once from the view when the environment provides the container.
@@ -111,10 +127,9 @@ class TransceiverViewModel: ObservableObject {
     private func setupBindings() {
         // Observe AudioManager state changes
         statusTimer = Timer.scheduledTimer(withTimeInterval: currentTimerInterval, repeats: true) { [weak self] _ in
-            guard let self = self, !self.isProcessingTick else { return }
-            self.isProcessingTick = true
             Task { @MainActor [weak self] in
-                guard let self = self else { return }
+                guard let self = self, !self.isProcessingTick else { return }
+                self.isProcessingTick = true
                 defer { self.isProcessingTick = false }
                 
                 // Update isRunning first for dependent UI state.

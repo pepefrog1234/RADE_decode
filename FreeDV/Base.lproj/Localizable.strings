@@ -179,6 +179,7 @@
 "SYNC" = "SYNC";
 "Synced" = "Synced";
 "This app includes third-party components under their respective licenses." = "This app includes third-party components under their respective licenses.";
+"Please use TestFlight feedback to report issues. If you are willing, include your email so we can follow up." = "Please use TestFlight feedback to report issues. If you are willing, include your email so we can follow up.";
 "Time (s)" = "Time (s)";
 "Today %@" = "Today %@";
 "Track Every Signal" = "Track Every Signal";

@@ -177,6 +177,7 @@
 "SYNC" = "同步";
 "Synced" = "已同步";
 "This app includes third-party components under their respective licenses." = "本 App 包含依各自授權條款提供的第三方元件。";
+"Please use TestFlight feedback to report issues. If you are willing, include your email so we can follow up." = "建議善用 TestFlight 問題回報系統。若您願意，請附上 email 以便我們進一步聯絡。";
 "Time (s)" = "時間（秒）";
 "Today %@" = "今天 %@";
 "Track Every Signal" = "追蹤每個訊號";
