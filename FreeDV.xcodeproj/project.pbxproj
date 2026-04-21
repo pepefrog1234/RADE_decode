@@ -65,6 +65,8 @@
 		197838E12F70CE9B00D284DA /* EooCallsignCodec.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = EooCallsignCodec.cpp; sourceTree = "<group>"; };
 		199C227B2F72920B00727B05 /* WidgetKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WidgetKit.framework; path = System/Library/Frameworks/WidgetKit.framework; sourceTree = SDKROOT; };
 		199C227D2F72920B00727B05 /* SwiftUI.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SwiftUI.framework; path = System/Library/Frameworks/SwiftUI.framework; sourceTree = SDKROOT; };
+		72E269132F98413D0028D78D /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
+		72E269162F98441E0028D78D /* Screenshot.PNG */ = {isa = PBXFileReference; lastKnownFileType = image.png; name = Screenshot.PNG; path = images/Screenshot.PNG; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -102,6 +104,8 @@
 		197838562F7028A000D284DA = {
 			isa = PBXGroup;
 			children = (
+				72E269162F98441E0028D78D /* Screenshot.PNG */,
+				72E269132F98413D0028D78D /* README.md */,
 				197838B62F70A51900D284DA /* RADE.xcconfig */,
 				197838612F7028A000D284DA /* FreeDV */,
 				199C227A2F72920B00727B05 /* Frameworks */,
