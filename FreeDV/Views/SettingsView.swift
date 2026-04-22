@@ -153,6 +153,34 @@ struct SettingsView: View {
                 }
             }
             
+            // User audio devices section (speaker + microphone)
+            Section("User Audio Devices") {
+                #if os(iOS)
+                if !deviceManager.availableInputs.isEmpty {
+                    if deviceManager.userInputName == kUnknownAudioDeviceName {
+                        NavigationLink("Select Microphone") {
+                            UserInputDevicePickerView(deviceManager: deviceManager)
+                        }
+                    } else {
+                        NavigationLink("Mic:  " + deviceManager.userInputName) {
+                            UserInputDevicePickerView(deviceManager: deviceManager)
+                        }
+                    }
+                }
+                if !deviceManager.availableOutputs.isEmpty {
+                    if deviceManager.userOutputName == kUnknownAudioDeviceName {
+                        NavigationLink("Select Speaker") {
+                            UserOutputDevicePickerView(deviceManager: deviceManager)
+                        }
+                    } else {
+                        NavigationLink("Speaker:  " + deviceManager.userOutputName) {
+                            UserOutputDevicePickerView(deviceManager: deviceManager)
+                        }
+                    }
+                }
+                #endif
+            }
+            
             // GPS tracking & background location
             Section("GPS Tracking") {
                 Toggle("Track Location During RX", isOn: Binding(
@@ -352,6 +380,62 @@ struct InputDevicePickerView: View {
             }
         }
         .navigationTitle("Input Device")
+    }
+}
+
+/// Picker for selecting user speaker output device
+struct UserOutputDevicePickerView: View {
+    @ObservedObject var deviceManager: AudioDeviceManager
+    
+    var body: some View {
+        List(deviceManager.availableOutputs) { device in
+            Button(action: {
+                deviceManager.selectUserOutput(device)
+            }) {
+                HStack {
+                    VStack(alignment: .leading) {
+                        Text(device.name)
+                        Text(device.portType)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if device.id == deviceManager.selectedUserOutputId {
+                        Image(systemName: "checkmark")
+                            .foregroundStyle(.blue)
+                    }
+                }
+            }
+        }
+        .navigationTitle("User Speaker")
+    }
+}
+
+/// Picker for selecting user microphone input device
+struct UserInputDevicePickerView: View {
+    @ObservedObject var deviceManager: AudioDeviceManager
+    
+    var body: some View {
+        List(deviceManager.availableInputs, id: \.uid) { port in
+            Button(action: {
+                deviceManager.selectUserInput(port)
+            }) {
+                HStack {
+                    VStack(alignment: .leading) {
+                        Text(port.portName)
+                        Text(port.portType.rawValue)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if port.uid == deviceManager.selectedUserInputUID {
+                        Image(systemName: "checkmark")
+                            .foregroundStyle(.blue)
+                    }
+                }
+            }
+        }
+        .navigationTitle("User Microphone")
     }
 }
 #endif

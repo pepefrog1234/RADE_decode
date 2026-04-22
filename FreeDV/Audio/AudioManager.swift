@@ -143,6 +143,18 @@ class AudioManager: ObservableObject {
         set { UserDefaults.standard.set(Double(newValue), forKey: "rxInputGainDb") }
     }
     
+    /// Saved ID for the user's preferred speaker output device.
+    static var userSpeakerOutputId: String {
+        get { UserDefaults.standard.string(forKey: "userAudioOutputId") ?? "speaker" }
+        set { UserDefaults.standard.set(newValue, forKey: "userAudioOutputId") }
+    }
+    
+    /// Saved UID for the user's preferred microphone input device.
+    static var userMicrophoneInputUID: String? {
+        get { UserDefaults.standard.string(forKey: "userAudioInputUID") }
+        set { UserDefaults.standard.set(newValue, forKey: "userAudioInputUID") }
+    }
+    
     // Reception logging
     var receptionLogger: ReceptionLogger?
     var wavRecorder: WAVRecorder?
@@ -168,6 +180,12 @@ class AudioManager: ObservableObject {
     // real-time audio render thread (no heap allocation, priority-inheriting lock).
     private let speechRing = AudioRingBuffer(capacity: 32768)  // ~2s at 16 kHz
     private var sourceNode: AVAudioSourceNode?
+    
+    /// Mixer node for decoded speech output to the user's selected speaker device.
+    private var speakerOutputNode: AVAudioMixerNode?
+    
+    /// Mixer node for user microphone input (prepared for future TX support).
+    private var microphoneInputNode: AVAudioMixerNode?
     
     // Dedicated processing queue to avoid blocking the real-time audio thread.
     // .userInitiated keeps processing near real-time for responsive sync display.
@@ -1416,8 +1434,17 @@ class AudioManager: ObservableObject {
             return noErr
         }
         sourceNode = node
+        let speakerMixer = AVAudioMixerNode()
+        speakerOutputNode = speakerMixer
+        let micMixer = AVAudioMixerNode()
+        microphoneInputNode = micMixer
+        
         audioEngine.attach(node)
-        audioEngine.connect(node, to: audioEngine.mainMixerNode, format: speechFormat)
+        audioEngine.attach(speakerMixer)
+        audioEngine.attach(micMixer)
+        audioEngine.connect(node, to: speakerMixer, format: speechFormat)
+        audioEngine.connect(speakerMixer, to: audioEngine.mainMixerNode, format: speechFormat)
+        // microphoneInputNode is attached but not connected (prepared for future TX)
         
         // Capture modem signal from mic / audio input
         // inputNode native format is typically 48 kHz with measurement mode
@@ -1533,10 +1560,18 @@ class AudioManager: ObservableObject {
 
         audioEngine.stop()
         
-        // Detach source node
+        // Detach source and user audio nodes
         if let node = sourceNode {
             audioEngine.detach(node)
             sourceNode = nil
+        }
+        if let node = speakerOutputNode {
+            audioEngine.detach(node)
+            speakerOutputNode = nil
+        }
+        if let node = microphoneInputNode {
+            audioEngine.detach(node)
+            microphoneInputNode = nil
         }
         
         // Clear speech ring buffer
