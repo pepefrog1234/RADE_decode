@@ -57,6 +57,8 @@ class TransceiverViewModel: ObservableObject {
     // Device info
     @Published var currentInputDevice: String = NSLocalizedString("Unknown", comment: "Unknown audio input device")
     @Published var currentOutputDevice: String = NSLocalizedString("Unknown", comment: "Unknown audio output device")
+    @Published var userMicDevice: String = NSLocalizedString("Unknown", comment: "Unknown user microphone device")
+    @Published var userSpeakerDevice: String = NSLocalizedString("Unknown", comment: "Unknown user speaker device")
     
     // Callsign (auto-clears after 10 seconds)
     @Published var decodedCallsign: String = ""
@@ -167,6 +169,8 @@ class TransceiverViewModel: ObservableObject {
                     
                     self.currentInputDevice = self.deviceManager.currentInputName
                     self.currentOutputDevice = self.deviceManager.currentOutputName
+                    self.userMicDevice = self.deviceManager.userInputName
+                    self.userSpeakerDevice = self.deviceManager.userOutputName
                 }
                 self.isRecording = self.audioManager.wavRecorder != nil
                 self.deferredDecodeInProgress = self.audioManager.deferredDecodeInProgress

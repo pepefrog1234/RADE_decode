@@ -279,14 +279,22 @@ struct BottomControls: View {
             // Device info + background hint
             VStack(spacing: 2) {
                 HStack(spacing: 4) {
-                    Text("IN: \(viewModel.currentInputDevice)")
+                    Text("RX: \(viewModel.currentInputDevice)")
                     Text("·")
-                    Text("OUT: \(viewModel.currentOutputDevice)")
+                    Text("TX: \(viewModel.currentOutputDevice)")
                 }
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(Color.gray.opacity(0.5))
                 .lineLimit(1)
                 
+                HStack(spacing: 4) {
+                    Text("Mic: \(viewModel.userMicDevice)")
+                    Text("·")
+                    Text("Spk: \(viewModel.userSpeakerDevice)")
+                }
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(Color.gray.opacity(0.5))
+                .lineLimit(1)
                 if viewModel.isRunning {
                     BackgroundHintLabel(viewModel: viewModel)
                 }
