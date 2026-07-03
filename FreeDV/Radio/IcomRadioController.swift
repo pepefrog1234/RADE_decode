@@ -170,6 +170,7 @@ final class IcomRadioController: ObservableObject {
         serial.onState = { [weak self] text in self?.onMain { self?.statusText = text } }
 
         let audio = IcomAudioStream(host: host, port: RadioSettings.audioPort,
+                                    enableTx: RadioSettings.enableTx,
                                     builder: makeBuilder(username, password, computer))
         audio.onRxAudio = { [weak self] samples in self?.onRxAudio?(samples) }
         audio.onState = { text in appLog("Icom[audio]: \(text)") }
@@ -220,6 +221,18 @@ final class IcomRadioController: ObservableObject {
         (hz > 0 && hz < 10_000_000) ? .lsb : .usb
     }
 
+    /// Configure for FreeDV only when the radio isn't already in the target
+    /// sideband-D mode — skips ~5 CI-V round-trips on every PTT press, so
+    /// keying is snappier once the radio is set up.
+    func configureForFreeDVTransmitIfNeeded() {
+        let target = freeDVMode(forHz: frequencyHz)
+        if mode == target && dataMode {
+            appLog("Icom: FreeDV mode already \(target)-D — skipping reconfig")
+            return
+        }
+        configureForFreeDVTransmit()
+    }
+
     /// Put the radio in sideband + data mode (LSB-D below 10 MHz, USB-D above)
     /// with the WLAN audio stream as the modulation source — required before
     /// FreeDV transmit.
@@ -245,14 +258,17 @@ final class IcomRadioController: ObservableObject {
 
     func setPTT(_ transmit: Bool) {
         appLog("Icom: PTT \(transmit ? "ON" : "OFF")")
+        // Let the audio stream classify FIFO drains (mid-over vs flush).
+        streamsLock.lock(); let audio = audioStream; streamsLock.unlock()
+        audio?.queue.async { audio?.setTxActive(transmit) }
         withSerial { $0.sendCiv(self.civ.setPTTFrame(transmit)) }
         onMain { self.isTransmitting = transmit }
     }
 
     // MARK: - Audio
 
-    /// Send one packet of TX modem samples (8 kHz 16-bit mono) to the radio.
-    /// Safe to call from any thread.
+    /// Queue TX modem samples (8 kHz 16-bit mono) for the radio; the audio
+    /// stream sends them at a steady 20 ms cadence. Safe to call from any thread.
     func sendTxAudio(_ samples: [Int16]) {
         streamsLock.lock(); let audio = audioStream; streamsLock.unlock()
         guard let audio else { return }

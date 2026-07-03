@@ -1734,7 +1734,7 @@ class AudioManager: ObservableObject {
 
         setRealtimeDecodePaused(true)
         radeWrapper.txReset()
-        radio.configureForFreeDVTransmit()
+        radio.configureForFreeDVTransmitIfNeeded()
         radio.setPTT(true)
 
         let inputFormat = inputNode.outputFormat(forBus: 0)
@@ -1768,8 +1768,13 @@ class AudioManager: ObservableObject {
             guard let self = self else { return }
             let eoo = self.radeWrapper.txEndOfOver(callsign: callsign)
             if !eoo.isEmpty { self.sendTxModemSamples(eoo) }
-            // Let the trailing audio drain before unkeying.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            // Flush padding: the paced audio stream only drains once its
+            // 200 ms prebuffer threshold is crossed, so push the EOO through
+            // with trailing silence (only zeros can remain stuck).
+            self.sendTxModemSamples([Int16](repeating: 0, count: 1600))
+            // Let the tail drain before unkeying: FIFO cushion (~200 ms) +
+            // EOO (~144 ms) + padding (200 ms) + radio jitter buffer (400 ms).
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.1) {
                 radio?.setPTT(false)
                 self.reporter?.reportTx(transmitting: false)
                 self.setRealtimeDecodePaused(false)

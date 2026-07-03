@@ -251,8 +251,10 @@ final class IcomPacketBuilder {
         p[ci.civPort] = Data(le: UInt32(civPort).bigEndian)
         p[ci.audioPort] = Data(le: UInt32(audioPort).bigEndian)
         // TX jitter-buffer latency in ms, big-endian (wfview sends its latency
-        // setting here, default 150). A large value delays/starves TX audio.
-        p[ci.txBuffer] = Data(le: UInt32(150).bigEndian)
+        // setting here). 400 ms rides out WiFi power-save/scan stalls and
+        // brief RF-desense hits during transmit while keeping PTT-to-RF
+        // latency tolerable; the paced 20 ms stream keeps it primed.
+        p[ci.txBuffer] = Data(le: UInt32(400).bigEndian)
         p[ci.convert] = Data(le: UInt8(1))
         if let remoteId { p[c.recvId] = Data(le: remoteId) }
         if let token { p[t.token] = Data(le: token) }

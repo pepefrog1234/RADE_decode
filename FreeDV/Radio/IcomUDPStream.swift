@@ -44,8 +44,9 @@ class IcomUDPStream {
     private let idleInterval = 1.0
     private let retryInterval = 5.0
 
-    // Retransmit tracking (bounded).
-    private static let trackDepth = 20
+    // Retransmit tracking (bounded). 64 packets ≈ 1.3 s of paced TX audio —
+    // deep enough to answer retransmit requests after a WiFi loss burst.
+    private static let trackDepth = 64
     private var trackedOrder: [UInt16] = []
     private var trackedData: [UInt16: Data] = [:]
     private var totalRetransmit = 0
@@ -53,12 +54,19 @@ class IcomUDPStream {
     private var lastPingSentAt = Date()
     private var lastPingSeq = UInt16(0)
 
+    /// Network service class for this stream's packets. The audio stream
+    /// overrides this to `.voice` (WMM voice queue + no WiFi power-save
+    /// batching) so paced audio doesn't stall during WiFi housekeeping.
+    var serviceClass: NWParameters.ServiceClass { .responsiveData }
+
     init(label: String, host: String, port: UInt16, builder: IcomPacketBuilder) {
         self.label = label
         self.host = host
         self.port = port
         self.builder = builder
-        self.queue = DispatchQueue(label: "com.freedv.icom.\(label)")
+        // Timely delivery matters more than throughput on these queues —
+        // the audio stream in particular runs a strict 20 ms pacing timer.
+        self.queue = DispatchQueue(label: "com.freedv.icom.\(label)", qos: .userInitiated)
     }
 
     // MARK: Lifecycle
@@ -67,6 +75,7 @@ class IcomUDPStream {
         let params = NWParameters.udp
         params.allowFastOpen = true
         params.allowLocalEndpointReuse = true
+        params.serviceClass = serviceClass
         // Bind our local UDP port to the same number as the radio's stream port.
         // The radio associates TX audio (and CI-V) with the port we advertise in
         // the conninfo packet; without this our source port is random and the
@@ -173,8 +182,12 @@ class IcomUDPStream {
         typealias p = PingField
         if current[p.request].boolByte {
             if current[c.sequence].u16 == lastPingSeq {
+                // Half round-trip in ms; surface only unhealthy readings so a
+                // struggling WiFi link is visible in the log during TX.
                 let latency = lastPingSentAt.timeIntervalSinceNow * -500.0
-                _ = latency  // available for future UI
+                if latency > 100 {
+                    appLog("Icom[\(label)]: ping RTT/2 ≈ \(Int(latency)) ms — WiFi link degraded")
+                }
             }
         } else if current[c.recvId].u32 == builder.myId {
             send(data: builder.pingReply(to: current))
@@ -192,6 +205,9 @@ class IcomUDPStream {
         let sequences = parseRetransmitRequest(current)
         for s in sequences { send(data: tracked(sequence: s)) }
         totalRetransmit &+= sequences.count
+        // Direct evidence of packet loss on the WiFi link (e.g. HF RF
+        // desensing 2.4 GHz during transmit) — worth surfacing every time.
+        appLog("Icom[\(label)]: radio requested retransmit of \(sequences.count) packet(s) (total \(totalRetransmit))")
         return true
     }
 

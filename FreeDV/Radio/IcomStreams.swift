@@ -8,6 +8,7 @@
 //
 
 import Foundation
+import Network
 
 // MARK: - Control stream
 
@@ -232,7 +233,11 @@ final class IcomAudioStream: IcomUDPStream {
     /// Decoded 16-bit LPCM samples received from the radio (RX audio).
     var onRxAudio: (([Int16]) -> Void)?
 
-    init(host: String, port: UInt16, builder: IcomPacketBuilder) {
+    /// Whether the conninfo requested a TX audio path (drives the paced stream).
+    private let enableTx: Bool
+
+    init(host: String, port: UInt16, enableTx: Bool, builder: IcomPacketBuilder) {
+        self.enableTx = enableTx
         super.init(label: "audio", host: host, port: port, builder: builder)
     }
 
@@ -252,28 +257,111 @@ final class IcomAudioStream: IcomUDPStream {
         armIdleTimer()
     }
 
-    private var txSentCount = 0
-
     // RX audio flow diagnostics (all touched on the stream queue only).
     private var rxAudioStarted = false
     private var rxWindowPackets = 0
     private var rxWindowBytes = 0
     private var rxWindowStart: Date?
 
-    /// Send one TX audio packet (16-bit LPCM samples).
+    /// TX audio gets the WMM voice queue and exemption from WiFi power-save
+    /// batching — paced packets must not stall during WiFi housekeeping.
+    override var serviceClass: NWParameters.ServiceClass { .interactiveVoice }
+
+    // MARK: TX pacing
+    //
+    // The radio expects a steady 20 ms audio stream (RS-BA1/wfview send one
+    // packet per audio-device callback). RADE produces modem samples in
+    // ~120 ms bursts; sent as-is, one late burst underruns the radio's
+    // jitter buffer and the SSB carrier drops out for a moment.
+    // So: samples are queued in a FIFO and drained 160 samples (20 ms) per
+    // timer tick, sending silence when the FIFO runs dry. Real audio only
+    // starts draining once the FIFO holds `txPrebufferSamples` — that
+    // pre-buffer is the steady-state cushion (production and consumption
+    // rates are equal, so whatever depth draining starts with is kept),
+    // absorbing late encoder bursts. All state is queue-confined.
+    private var txFifo: [Int16] = []
+    private var txPaceTimer: DispatchSourceTimer?
+    private var txDraining = false
+    private let txChunkSamples = 160                  // 20 ms @ 8 kHz
+    private let txPrebufferSamples = 1600             // 200 ms cushion
+    private let txFifoCap = 16000                     // 2 s safety cap
+    private var txRealPacketCount = 0
+    private var txUnderrunCount = 0
+    /// Mirrors PTT (set via setTxActive) so drain events can be classified:
+    /// PTT down = mid-over underrun (bad), PTT up = end-of-over flush (normal).
+    private var txActive = false
+
+    /// Called (on the stream queue) when PTT changes.
+    func setTxActive(_ active: Bool) {
+        txActive = active
+        guard active, txPaceTimer != nil else { return }
+        // Prime the pipeline: pre-fill the prebuffer with leading silence so
+        // draining starts on the next tick instead of holding the first modem
+        // burst back until the threshold fills — cuts ~200 ms off PTT-to-RF
+        // while keeping the same cushion depth (as zeros at first).
+        if !txDraining, txFifo.count < txPrebufferSamples {
+            let padding = txPrebufferSamples - txFifo.count
+            txFifo.insert(contentsOf: [Int16](repeating: 0, count: padding), at: 0)
+        }
+    }
+
+    /// Queue TX modem samples; the pacing timer sends them at 20 ms cadence.
     func sendAudio(_ samples: [Int16]) {
         guard !samples.isEmpty else { return }
-        let packet = builder.audioPacket(samples: samples)
-        txSentCount += 1
-        if txSentCount == 1 {
-            let header = packet.prefix(0x18).map { String(format: "%02x", $0) }.joined(separator: " ")
-            appLog("Icom[audio]: TX pkt#1 header(0x18)=\(header) totalBytes=\(packet.count) remoteId=\(builder.remoteId != nil ? "set" : "NIL")")
-        } else if txSentCount % 50 == 0 {
-            appLog("Icom[audio]: TX packet #\(txSentCount)")
+        txFifo.append(contentsOf: samples)
+        if txFifo.count > txFifoCap {
+            txFifo.removeFirst(txFifo.count - txFifoCap)
         }
+    }
+
+    private func startTxPacing() {
+        guard enableTx, txPaceTimer == nil else { return }
+        let t = DispatchSource.makeTimerSource(flags: .strict, queue: queue)
+        t.schedule(deadline: .now() + 0.02, repeating: 0.02, leeway: .milliseconds(2))
+        t.setEventHandler { [weak self] in self?.sendPacedTxPacket() }
+        t.resume()
+        txPaceTimer = t
+        appLog("Icom[audio]: TX pacing started (20 ms/packet, \(txPrebufferSamples / 8) ms prebuffer)")
+    }
+
+    private func sendPacedTxPacket() {
+        if !txDraining, txFifo.count >= txPrebufferSamples {
+            txDraining = true
+        }
+        let chunk: [Int16]
+        if txDraining, txFifo.count >= txChunkSamples {
+            chunk = Array(txFifo.prefix(txChunkSamples))
+            txFifo.removeFirst(txChunkSamples)
+            txRealPacketCount += 1
+            if txRealPacketCount == 1 {
+                appLog("Icom[audio]: first TX audio packet (remoteId=\(builder.remoteId != nil ? "set" : "NIL"))")
+            } else if txRealPacketCount % 250 == 0 {
+                appLog("Icom[audio]: TX audio #\(txRealPacketCount) fifo=\(txFifo.count) underruns=\(txUnderrunCount)")
+            }
+        } else {
+            if txDraining {
+                // Refill the whole prebuffer before resuming either way.
+                txDraining = false
+                txUnderrunCount += 1
+                if txActive {
+                    appLog("Icom[audio]: TX FIFO drained #\(txUnderrunCount) after \(txRealPacketCount) packets — MID-OVER UNDERRUN (encoder starved)")
+                } else {
+                    appLog("Icom[audio]: TX FIFO drained #\(txUnderrunCount) after \(txRealPacketCount) packets (end-of-over flush, normal)")
+                }
+            }
+            // Full silence packet; queued samples stay intact so the modem
+            // waveform remains sample-continuous when draining resumes.
+            chunk = [Int16](repeating: 0, count: txChunkSamples)
+        }
+        let packet = builder.audioPacket(samples: chunk)
         // Track for retransmit (wfview sends TX audio via its tracked path).
         track(data: packet)
         send(data: packet)
+    }
+
+    override func invalidateTimers() {
+        txPaceTimer?.cancel(); txPaceTimer = nil
+        super.invalidateTimers()
     }
 
     override func receive(data: Data) {
@@ -293,6 +381,7 @@ final class IcomAudioStream: IcomUDPStream {
                 invalidateTimers()
                 armIdleTimer()
                 armPingTimer()
+                startTxPacing()
             }, onIAmReady: { })
         case PingField.dataLength:
             receivePing()
