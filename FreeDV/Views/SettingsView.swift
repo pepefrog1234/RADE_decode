@@ -14,6 +14,13 @@ struct SettingsView: View {
     @AppStorage("rxInputGainDb") private var rxInputGainDb = 0.0
     @AppStorage("rxEqCompensationEnabled") private var rxEqCompensationEnabled = false
     @AppStorage("rxEqCompensationGainDb") private var rxEqCompensationGainDb = 4.5
+    @AppStorage("audioInputSource") private var audioSourceRaw = AudioInputSource.device.rawValue
+
+    /// IC-705 WiFi is the audio source — the reporter frequency follows the
+    /// radio dial and is not manually editable.
+    private var frequencyLockedToRadio: Bool {
+        audioSourceRaw == AudioInputSource.icomRadio.rawValue
+    }
     
     var body: some View {
         Form {
@@ -50,10 +57,29 @@ struct SettingsView: View {
                         .disabled(locationHelper.isLocating)
                     }
                     
-                    NavigationLink {
-                        FrequencyPickerView(frequencyHz: $reporter.frequencyHz)
-                    } label: {
-                        LabeledContent("Frequency", value: formatFrequency(reporter.frequencyHz))
+                    if frequencyLockedToRadio {
+                        // Frequency follows the IC-705 dial — shown locked.
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Frequency")
+                                    .foregroundStyle(.secondary)
+                                Text("Synced from IC-705")
+                                    .font(.caption)
+                                    .foregroundStyle(.tertiary)
+                            }
+                            Spacer()
+                            Image(systemName: "lock.fill")
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                            Text(formatFrequency(reporter.frequencyHz))
+                                .foregroundStyle(.secondary)
+                        }
+                    } else {
+                        NavigationLink {
+                            FrequencyPickerView(frequencyHz: $reporter.frequencyHz)
+                        } label: {
+                            LabeledContent("Frequency", value: formatFrequency(reporter.frequencyHz))
+                        }
                     }
                     
                     HStack {

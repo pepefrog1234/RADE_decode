@@ -1625,6 +1625,7 @@ class AudioManager: ObservableObject {
         if isTransmitting {
             removeTxTap()
             radioController?.setPTT(false)
+            reporter?.reportTx(transmitting: false)
             DispatchQueue.main.async { self.isTransmitting = false }
         }
 
@@ -1751,6 +1752,7 @@ class AudioManager: ObservableObject {
         }
         appLog("TX: mic format ch=\(inputFormat.channelCount) sr=\(inputFormat.sampleRate) → 16kHz Int16")
         installTxTap(inputFormat: inputFormat)
+        reporter?.reportTx(transmitting: true)
         DispatchQueue.main.async { self.isTransmitting = true }
     }
 
@@ -1769,6 +1771,7 @@ class AudioManager: ObservableObject {
             // Let the trailing audio drain before unkeying.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
                 radio?.setPTT(false)
+                self.reporter?.reportTx(transmitting: false)
                 self.setRealtimeDecodePaused(false)
                 self.isTransmitting = false
             }

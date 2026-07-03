@@ -108,6 +108,10 @@ class TransceiverViewModel: ObservableObject {
     /// Prevent Task accumulation — skip tick if previous Task is still running
     private var isProcessingTick = false
 
+    // Debounce state for mirroring the IC-705 dial to the FreeDV Reporter.
+    private var reporterFreqCandidate: UInt64 = 0
+    private var reporterFreqCandidateSince: Date?
+
     private var backgroundObservers: [Any] = []
     private var backgroundEnterTime: Date?
     private var deferredDecodeWasActiveBeforeBackground = false
@@ -209,6 +213,7 @@ class TransceiverViewModel: ObservableObject {
                     self.radioDataMode = radio.dataMode
                     self.radioIsTransmitting = radio.isTransmitting
                 }
+                self.syncReporterFrequencyFromRadio()
                 self.deferredDecodeInProgress = self.audioManager.deferredDecodeInProgress
                 self.deferredDecodeProgress = self.audioManager.deferredDecodeProgress
                 self.deferredDecodeStatusText = self.audioManager.deferredDecodeStatusText
@@ -247,6 +252,27 @@ class TransceiverViewModel: ObservableObject {
 
     func connectRadio() { radioController?.connect() }
     func disconnectRadio() { radioController?.disconnect() }
+
+    /// While the IC-705 is the audio source, mirror its dial frequency to the
+    /// FreeDV Reporter. Debounced: the value must sit unchanged for 0.5 s
+    /// before it is pushed, so spinning the dial doesn't spam freq_change.
+    private func syncReporterFrequencyFromRadio() {
+        guard usingRadioSource, radioConnected, radioFrequencyHz > 0,
+              let reporter, reporter.frequencyHz != radioFrequencyHz else {
+            reporterFreqCandidateSince = nil
+            return
+        }
+        let hz = radioFrequencyHz
+        if hz != reporterFreqCandidate {
+            reporterFreqCandidate = hz
+            reporterFreqCandidateSince = Date()
+        } else if let since = reporterFreqCandidateSince,
+                  Date().timeIntervalSince(since) >= 0.5 {
+            appLog("Reporter: frequency synced from IC-705 → \(hz) Hz")
+            reporter.frequencyHz = hz
+            reporterFreqCandidateSince = nil
+        }
+    }
 
     func tuneRadio(toHz hz: UInt64) { radioController?.setFrequency(hz) }
     func setRadioMode(_ mode: RadioMode) { radioController?.setMode(mode) }

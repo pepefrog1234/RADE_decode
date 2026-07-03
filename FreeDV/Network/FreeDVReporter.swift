@@ -348,22 +348,25 @@ class FreeDVReporter {
             ]
             appLog("Reporter: connecting as viewer (no callsign)")
         } else {
-            // RX-only SWL mode
             var osVersion = "iOS"
             #if os(iOS)
             osVersion = "iOS \(UIDevice.current.systemVersion)"
             #endif
-            
+
+            // RX-only SWL unless the IC-705 WiFi transmit path is available.
+            // (Evaluated at connect time; changing the audio source while
+            // connected takes effect on the next reconnect.)
+            let rxOnly = !(RadioSettings.audioInputSource == .icomRadio && RadioSettings.enableTx)
             auth = [
                 "role": "report",
                 "callsign": callsign.uppercased(),
                 "grid_square": gridSquare,
                 "version": "RADE Decode iOS \(Bundle.main.shortVersion)",
-                "rx_only": true,
+                "rx_only": rxOnly,
                 "os": osVersion,
                 "protocol_version": protocolVersion
             ]
-            appLog("Reporter: connecting as \(callsign.uppercased()) (\(gridSquare))")
+            appLog("Reporter: connecting as \(callsign.uppercased()) (\(gridSquare)) rxOnly=\(rxOnly)")
         }
         
         if let jsonData = try? JSONSerialization.data(withJSONObject: auth),
@@ -386,6 +389,17 @@ class FreeDVReporter {
             "snr": snr
         ])
         appLog("Reporter: rx_report sent — \(callsign) SNR=\(snr)")
+    }
+
+    /// Report our transmit state (PTT down/up) — the site highlights the
+    /// station while it is transmitting.
+    func reportTx(transmitting: Bool) {
+        guard isReady else { return }
+        sendEvent("tx_report", [
+            "mode": "RADEV1",
+            "transmitting": transmitting
+        ])
+        appLog("Reporter: tx_report sent — transmitting=\(transmitting)")
     }
     
     /// Send status message update
