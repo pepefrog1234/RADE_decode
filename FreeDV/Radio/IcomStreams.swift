@@ -254,6 +254,12 @@ final class IcomAudioStream: IcomUDPStream {
 
     private var txSentCount = 0
 
+    // RX audio flow diagnostics (all touched on the stream queue only).
+    private var rxAudioStarted = false
+    private var rxWindowPackets = 0
+    private var rxWindowBytes = 0
+    private var rxWindowStart: Date?
+
     /// Send one TX audio packet (16-bit LPCM samples).
     func sendAudio(_ samples: [Int16]) {
         guard !samples.isEmpty else { return }
@@ -274,6 +280,7 @@ final class IcomAudioStream: IcomUDPStream {
         typealias a = AudioField
         if current.count > a.headerLength {
             let payload = current.dropFirst(a.headerLength)
+            noteRxAudio(payload.count)
             deliverAudio(payload)
             return
         }
@@ -284,12 +291,35 @@ final class IcomAudioStream: IcomUDPStream {
                 onState?("Audio connected")
                 send(data: builder.areYouReadyPacket())
                 invalidateTimers()
+                armIdleTimer()
                 armPingTimer()
             }, onIAmReady: { })
         case PingField.dataLength:
             receivePing()
         default:
             break
+        }
+    }
+
+    /// Log RX audio flow: first packet, then packet/sample rate every ~5 s.
+    /// ~8000 samples/s confirms the negotiated 8 kHz LPCM stream is arriving.
+    private func noteRxAudio(_ payloadBytes: Int) {
+        if !rxAudioStarted {
+            rxAudioStarted = true
+            appLog("Icom[audio]: RX audio streaming started (\(payloadBytes)-byte payload)")
+        }
+        rxWindowPackets += 1
+        rxWindowBytes += payloadBytes
+        let now = Date()
+        guard let start = rxWindowStart else { rxWindowStart = now; return }
+        let dt = now.timeIntervalSince(start)
+        if dt >= 5 {
+            let samplesPerSec = Double(rxWindowBytes) / 2.0 / dt
+            appLog(String(format: "Icom[audio]: RX %.1f pkt/s, ~%.0f samples/s",
+                          Double(rxWindowPackets) / dt, samplesPerSec))
+            rxWindowStart = now
+            rxWindowPackets = 0
+            rxWindowBytes = 0
         }
     }
 

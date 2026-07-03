@@ -47,6 +47,9 @@ final class IcomRadioController: ObservableObject {
 
     private var host = RadioSettings.defaultHost
     private let audioFormat = IcomAudioFormat.freeDVDefault
+    /// Last frequency seen by the CI-V parser (serial-queue only) — used to
+    /// detect 10 MHz sideband-convention crossings.
+    private var lastFrequencyOnSerial: UInt64 = 0
 
     private func onMain(_ block: @escaping () -> Void) {
         if Thread.isMainThread { block() } else { DispatchQueue.main.async(execute: block) }
@@ -136,7 +139,22 @@ final class IcomRadioController: ObservableObject {
         let computer = RadioSettings.computer
 
         // CI-V callbacks (fire on serial queue → hop to main for @Published).
-        civ.onFrequency = { [weak self] hz in self?.onMain { self?.frequencyHz = hz } }
+        civ.onFrequency = { [weak self] hz in
+            guard let self else { return }
+            // Auto-flip the sideband when the dial crosses the 10 MHz
+            // convention boundary (LSB-D below, USB-D above).
+            let previous = self.lastFrequencyOnSerial
+            self.lastFrequencyOnSerial = hz
+            if previous > 0, self.freeDVMode(forHz: previous) != self.freeDVMode(forHz: hz) {
+                let mode = self.freeDVMode(forHz: hz)
+                appLog("Icom: dial crossed 10 MHz — switching to \(mode)-D")
+                self.withSerial {
+                    $0.sendCiv(self.civ.setModeDataFrame(mode, dataOn: true))
+                    $0.sendCiv(self.civ.readModeDataFrame())
+                }
+            }
+            self.onMain { self.frequencyHz = hz }
+        }
         civ.onMode = { [weak self] mode, data in
             appLog("Icom: mode readback = \(mode)\(data ? "-D" : "") (dataMode=\(data))")
             self?.onMain { self?.mode = mode; self?.dataMode = data }
@@ -167,6 +185,15 @@ final class IcomRadioController: ObservableObject {
             serial.sendCiv(self.civ.readFrequencyFrame())
             serial.sendCiv(self.civ.readModeFrame())
         }
+
+        // Once the initial poll has answered, put the radio into FreeDV
+        // operating mode (LSB-D/USB-D per band + DATA MOD=WLAN) so RX decode
+        // works immediately — without this the radio may sit on the wrong
+        // sideband and RADE never syncs.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
+            guard let self, self.isConnected else { return }
+            self.configureForFreeDVTransmit()
+        }
     }
 
     // MARK: - Control API
@@ -187,13 +214,22 @@ final class IcomRadioController: ObservableObject {
         withSerial { $0.sendCiv(self.civ.setModeFrame(mode)) }
     }
 
-    /// Put the radio in USB + data mode with the WLAN audio stream as the
-    /// modulation source — required before FreeDV transmit.
+    /// Amateur-band sideband convention: LSB below 10 MHz, USB at/above.
+    /// Unknown frequency (0, not yet read back) falls back to USB.
+    private func freeDVMode(forHz hz: UInt64) -> RadioMode {
+        (hz > 0 && hz < 10_000_000) ? .lsb : .usb
+    }
+
+    /// Put the radio in sideband + data mode (LSB-D below 10 MHz, USB-D above)
+    /// with the WLAN audio stream as the modulation source — required before
+    /// FreeDV transmit.
     func configureForFreeDVTransmit() {
-        appLog("Icom: configuring USB-D + DATA MOD=WLAN for FreeDV TX")
+        let hz = frequencyHz
+        let mode = freeDVMode(forHz: hz)
+        appLog("Icom: configuring \(mode)-D + DATA MOD=WLAN for FreeDV TX (freq=\(hz) Hz)")
         withSerial {
             // Atomic mode+data+filter set (reliable on IC-705).
-            $0.sendCiv(self.civ.setModeDataFrame(.usb, dataOn: true))
+            $0.sendCiv(self.civ.setModeDataFrame(mode, dataOn: true))
             // Route TX modulation from the WLAN audio stream. The radio keys up
             // without this, but modulates from its DATA MOD default (USB/MIC),
             // so the WiFi audio never reaches the transmitter.
@@ -201,6 +237,9 @@ final class IcomRadioController: ObservableObject {
             // Read back so the log shows the radio's actual mode/mod-input state.
             $0.sendCiv(self.civ.readModeDataFrame())
             $0.sendCiv(self.civ.readDataModInputFrame())
+            // Refresh the cached frequency so the next PTT picks the right
+            // sideband even if CI-V transceive updates are disabled.
+            $0.sendCiv(self.civ.readFrequencyFrame())
         }
     }
 

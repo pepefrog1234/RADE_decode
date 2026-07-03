@@ -107,7 +107,15 @@ class AudioManager: ObservableObject {
     // MARK: - IC-705 WiFi integration
 
     /// Radio controller (set by the view model). Used for network RX/TX audio.
-    var radioController: IcomRadioController?
+    /// RX audio is wired immediately so diagnostics work before START; actual
+    /// decoding is gated inside feedRadioRxSamples.
+    var radioController: IcomRadioController? {
+        didSet {
+            radioController?.onRxAudio = { [weak self] samples in
+                self?.feedRadioRxSamples(samples)
+            }
+        }
+    }
 
     /// True while transmitting FreeDV to the radio (half-duplex).
     @Published var isTransmitting = false
@@ -1489,11 +1497,9 @@ class AudioManager: ObservableObject {
             deviceInputFormat = inputFormat
         } else {
             // IC-705 WiFi: modem audio arrives over the network at 8 kHz and is
-            // fed directly to RADE. No mic tap or converter needed.
+            // fed directly to RADE (wired in radioController.didSet). No mic
+            // tap or converter needed.
             appLog("RX source: IC-705 WiFi (network audio → RADE)")
-            radioController?.onRxAudio = { [weak self] samples in
-                self?.feedRadioRxSamples(samples)
-            }
         }
 
         shouldProcess = true
@@ -1579,13 +1585,13 @@ class AudioManager: ObservableObject {
         // Stop health monitoring
         stopHealthCheckTimer()
 
-        // Tear down TX + IC-705 network RX hooks.
+        // Tear down TX hooks. The IC-705 network RX callback stays wired —
+        // feedRadioRxSamples gates on shouldProcess/input source.
         if isTransmitting {
             removeTxTap()
             radioController?.setPTT(false)
             DispatchQueue.main.async { self.isTransmitting = false }
         }
-        radioController?.onRxAudio = nil
 
         removeInputTapIfInstalled()
 
@@ -1920,14 +1926,42 @@ class AudioManager: ObservableObject {
         feedModemSamples(channelData[0], count: convertedCount, needsRawCapture: needsRawCapture)
     }
 
+    /// Throttle for the "network audio arriving but not decoding" hint log.
+    private var lastIdleNetworkRxLogDate: Date?
+
+    /// Batches 20 ms network packets into ~100 ms chunks before they enter the
+    /// decode pipeline (touched on the audio stream queue only). Feeding RADE
+    /// 50 tiny chunks/s overflows the pending-chunk cap during each inference
+    /// burst (6 × 20 ms = 120 ms headroom) and ~20% of audio gets dropped;
+    /// batched like the mic path (6 × 100 ms) the queue never fills.
+    private var networkRxBatch: [Int16] = []
+    private let networkRxBatchTarget = 800   // samples @ 8 kHz = 100 ms
+
     /// Feed 8 kHz mono Int16 modem samples from an RX stream from the IC-705
     /// (WiFi). Copies the samples and routes them through the shared decode path.
     func feedRadioRxSamples(_ samples: [Int16]) {
-        guard shouldProcess else { return }
+        // Only decode network audio when it is the selected input source
+        // (checked per call so a mid-session source switch takes effect and
+        // the mic and network never feed RADE at the same time).
+        guard RadioSettings.audioInputSource == .icomRadio else { return }
+        guard shouldProcess else {
+            networkRxBatch.removeAll(keepingCapacity: false)
+            let now = Date()
+            if lastIdleNetworkRxLogDate.map({ now.timeIntervalSince($0) > 10 }) ?? true {
+                lastIdleNetworkRxLogDate = now
+                appLog("AudioManager: IC-705 RX audio arriving but transceiver not started — press START to decode")
+            }
+            return
+        }
         processingBackpressureLock.lock()
         lastRxInputCallbackDate = Date()
         processingBackpressureLock.unlock()
-        samples.withUnsafeBufferPointer { buf in
+
+        networkRxBatch.append(contentsOf: samples)
+        guard networkRxBatch.count >= networkRxBatchTarget else { return }
+        let batch = networkRxBatch
+        networkRxBatch.removeAll(keepingCapacity: true)
+        batch.withUnsafeBufferPointer { buf in
             guard let ptr = buf.baseAddress else { return }
             feedModemSamples(ptr, count: buf.count, needsRawCapture: backgroundMode && backgroundRawSampleCaptureEnabled)
         }
