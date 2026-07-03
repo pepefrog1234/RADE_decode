@@ -4,9 +4,11 @@ import SwiftUI
 struct SpectrumView: View {
     let fftData: [Float]
     
-    // Frequency range for RADE: 0 - 4000 Hz (Nyquist of 8kHz)
+    // Frequency range for RADE: 0 - 3000 Hz (modem band of interest)
     private let minDB: Float = -100
     private let maxDB: Float = 0
+    private let maxFreq: CGFloat = 3000
+    private let nyquistFreq: CGFloat = 4000  // 8kHz sample rate / 2
     
     var body: some View {
         ZStack {
@@ -24,7 +26,9 @@ struct SpectrumView: View {
                 
                 let width = size.width
                 let height = size.height
-                let binCount = fftData.count
+                let totalBins = fftData.count
+                // Only display bins covering 0-3kHz (3/4 of Nyquist range)
+                let displayBins = totalBins * Int(maxFreq) / Int(nyquistFreq)
                 
                 // Build the spectrum path
                 var linePath = Path()
@@ -32,8 +36,8 @@ struct SpectrumView: View {
                 
                 fillPath.move(to: CGPoint(x: 0, y: height))
                 
-                for i in 0..<binCount {
-                    let x = CGFloat(i) / CGFloat(binCount) * width
+                for i in 0..<displayBins {
+                    let x = CGFloat(i) / CGFloat(displayBins) * width
                     let normalized = CGFloat(
                         (fftData[i] - minDB) / (maxDB - minDB)
                     ).clamped(to: 0...1)
@@ -79,8 +83,6 @@ struct SpectrumView: View {
                     Text("2k")
                     Spacer()
                     Text("3k")
-                    Spacer()
-                    Text("4k")
                 }
                 .font(.system(size: 8, weight: .medium, design: .monospaced))
                 .foregroundColor(Color.gray.opacity(0.7))
@@ -105,9 +107,8 @@ struct SpectrumView: View {
     }
     
     private func drawGrid(context: GraphicsContext, size: CGSize) {
-        let gridFreqs: [CGFloat] = [1000, 2000, 3000]
+        let gridFreqs: [CGFloat] = [1000, 2000]
         let guideFreqs: [CGFloat] = [750, 1500, 2200]
-        let maxFreq: CGFloat = 4000
         
         // Vertical frequency lines
         for freq in gridFreqs {

@@ -7,6 +7,8 @@ struct WaterfallView: View {
     
     private let minDB: Float = -100
     private let maxDB: Float = 0
+    private let maxFreq: CGFloat = 3000
+    private let nyquistFreq: CGFloat = 4000  // 8kHz sample rate / 2
     
     var body: some View {
         ZStack {
@@ -20,10 +22,12 @@ struct WaterfallView: View {
                 
                 for (rowIndex, row) in history.enumerated() {
                     let y = CGFloat(rowIndex) * rowHeight
-                    let binCount = row.count
-                    let binWidth = size.width / CGFloat(max(binCount, 1))
+                    let totalBins = row.count
+                    // Only display bins covering 0-3kHz (3/4 of Nyquist range)
+                    let displayBins = totalBins * Int(maxFreq) / Int(nyquistFreq)
+                    let binWidth = size.width / CGFloat(max(displayBins, 1))
                     
-                    for (binIndex, value) in row.enumerated() {
+                    for (binIndex, value) in row.prefix(displayBins).enumerated() {
                         let x = CGFloat(binIndex) * binWidth
                         let normalized = Double(
                             (value - minDB) / (maxDB - minDB)
@@ -37,7 +41,6 @@ struct WaterfallView: View {
                 
                 // Frequency reference lines to help tuning alignment
                 let guideFreqs: [CGFloat] = [750, 1500, 2200]
-                let maxFreq: CGFloat = 4000
                 for freq in guideFreqs {
                     let x = freq / maxFreq * size.width
                     var path = Path()

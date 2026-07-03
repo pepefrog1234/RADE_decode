@@ -25,11 +25,23 @@ class AudioDeviceManager: ObservableObject {
     @Published var availableOutputs: [OutputDevice] = []
     @Published var selectedOutputId: String = "default"
     
+    // User audio device preferences (speaker + microphone, separate from transceiver)
+    @Published var userInputName: String = kUnknownAudioDeviceName
+    @Published var userOutputName: String = kUnknownAudioDeviceName
+    @Published var selectedUserOutputId: String = "speaker"
+    @Published var selectedUserInputUID: String?
+    
+    private static let kUserInputUIDKey = "userAudioInputUID"
+    private static let kUserOutputIdKey = "userAudioOutputId"
 
     #endif
     
     init() {
         #if os(iOS)
+        // Restore saved user audio preferences
+        selectedUserInputUID = UserDefaults.standard.string(forKey: Self.kUserInputUIDKey)
+        selectedUserOutputId = UserDefaults.standard.string(forKey: Self.kUserOutputIdKey) ?? "speaker"
+        
         updateDeviceInfo()
         
         NotificationCenter.default.addObserver(
@@ -54,6 +66,7 @@ class AudioDeviceManager: ObservableObject {
             self.currentOutputName = route.outputs.first?.portName ?? "None"
             self.availableInputs = session.availableInputs ?? []
             self.buildOutputList(route: route)
+            self.resolveUserAudioDeviceNames()
         }
         #endif
     }
@@ -117,6 +130,48 @@ class AudioDeviceManager: ObservableObject {
             updateDeviceInfo()
         } catch {
             print("Failed to select input: \(error)")
+        }
+    }
+    
+    /// Select user microphone input device and persist preference.
+    func selectUserInput(_ port: AVAudioSessionPortDescription) {
+        selectedUserInputUID = port.uid
+        userInputName = port.portName
+        UserDefaults.standard.set(port.uid, forKey: Self.kUserInputUIDKey)
+    }
+    
+    /// Select user speaker output device and persist preference.
+    func selectUserOutput(_ device: OutputDevice) {
+        selectedUserOutputId = device.id
+        userOutputName = device.name
+        UserDefaults.standard.set(device.id, forKey: Self.kUserOutputIdKey)
+    }
+    
+    /// Resolve user audio device display names from saved preferences.
+    /// Clears preferences if the saved device is no longer available.
+    private func resolveUserAudioDeviceNames() {
+        // Resolve user input name from saved UID
+        if let uid = selectedUserInputUID {
+            if let match = availableInputs.first(where: { $0.uid == uid }) {
+                userInputName = match.portName
+            } else {
+                // Saved device no longer available
+                selectedUserInputUID = nil
+                userInputName = kUnknownAudioDeviceName
+                UserDefaults.standard.removeObject(forKey: Self.kUserInputUIDKey)
+            }
+        }
+        
+        // Resolve user output name ("speaker" is always valid)
+        if selectedUserOutputId == "speaker" {
+            userOutputName = "iPhone Speaker"
+        } else if let match = availableOutputs.first(where: { $0.id == selectedUserOutputId }) {
+            userOutputName = match.name
+        } else {
+            // Saved device no longer available — fall back to speaker
+            selectedUserOutputId = "speaker"
+            userOutputName = "iPhone Speaker"
+            UserDefaults.standard.set("speaker", forKey: Self.kUserOutputIdKey)
         }
     }
     

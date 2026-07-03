@@ -175,6 +175,18 @@ class AudioManager: ObservableObject {
         set { UserDefaults.standard.set(Double(newValue), forKey: "rxInputGainDb") }
     }
     
+    /// Saved ID for the user's preferred speaker output device.
+    static var userSpeakerOutputId: String {
+        get { UserDefaults.standard.string(forKey: "userAudioOutputId") ?? "speaker" }
+        set { UserDefaults.standard.set(newValue, forKey: "userAudioOutputId") }
+    }
+    
+    /// Saved UID for the user's preferred microphone input device.
+    static var userMicrophoneInputUID: String? {
+        get { UserDefaults.standard.string(forKey: "userAudioInputUID") }
+        set { UserDefaults.standard.set(newValue, forKey: "userAudioInputUID") }
+    }
+    
     // Reception logging
     var receptionLogger: ReceptionLogger?
     var wavRecorder: WAVRecorder?
@@ -200,6 +212,12 @@ class AudioManager: ObservableObject {
     // real-time audio render thread (no heap allocation, priority-inheriting lock).
     private let speechRing = AudioRingBuffer(capacity: 32768)  // ~2s at 16 kHz
     private var sourceNode: AVAudioSourceNode?
+    
+    /// Mixer node for decoded speech output to the user's selected speaker device.
+    private var speakerOutputNode: AVAudioMixerNode?
+    
+    /// Mixer node for user microphone input (prepared for future TX support).
+    private var microphoneInputNode: AVAudioMixerNode?
     
     // Dedicated processing queue to avoid blocking the real-time audio thread.
     // .userInitiated keeps processing near real-time for responsive sync display.
@@ -308,8 +326,8 @@ class AudioManager: ObservableObject {
     // MARK: - Background Task
 
     func setBackgroundDecodeOnly(_ enabled: Bool) {
-        // In foreground RX isolation mode we suppress decoded-audio playback,
-        // so FARGAN synthesis is unnecessary CPU load. Keep it disabled there.
+        // In background mode, skip FARGAN synthesis to save CPU.
+        // In foreground, enable synthesis so decoded audio plays through the user speaker.
         #if os(iOS)
         let shouldSynthesize = !enabled && !isForegroundRxIsolationEnabled()
         #else
@@ -932,12 +950,11 @@ class AudioManager: ObservableObject {
         return [.allowBluetooth, .defaultToSpeaker]
     }
     
-    /// Foreground RX isolation mode is fixed on for best decode stability.
-    /// Disabled for IC-705 network RX — there is no mic-to-speaker feedback
-    /// path, so decoded speech should play out the phone speaker.
+    /// Foreground RX isolation mode — disabled so decoded audio plays through
+    /// the user's selected speaker output device (also covers IC-705 network
+    /// RX, which has no mic-to-speaker feedback path).
     private func isForegroundRxIsolationEnabled() -> Bool {
-        if RadioSettings.audioInputSource == .icomRadio { return false }
-        return !backgroundMode
+        return false
     }
     #endif
     
@@ -1427,14 +1444,9 @@ class AudioManager: ObservableObject {
             print("Failed to disable voice processing: \(error)")
         }
         
-        // Always keep a source node attached for stable AVAudioEngine I/O behavior
-        // across device models. Isolation is enforced by suppressing writes into
-        // the playback ring buffer (see onDecodedAudio callback).
+        // Source node feeds decoded speech through speakerOutputNode to the user's
+        // selected speaker. Ring buffer bridges the processing queue → render thread.
         speechRing.reset()
-        
-        if isForegroundRxIsolationEnabled() {
-            appLog("RX isolation enabled: decoded-audio writes suppressed")
-        }
         let ring = speechRing  // capture the reference, not self
         let node = AVAudioSourceNode(format: speechFormat) { [weak self] _, _, frameCount, audioBufferList -> OSStatus in
             let ablPointer = UnsafeMutableAudioBufferListPointer(audioBufferList)
@@ -1458,8 +1470,17 @@ class AudioManager: ObservableObject {
             return noErr
         }
         sourceNode = node
+        let speakerMixer = AVAudioMixerNode()
+        speakerOutputNode = speakerMixer
+        let micMixer = AVAudioMixerNode()
+        microphoneInputNode = micMixer
+        
         audioEngine.attach(node)
-        audioEngine.connect(node, to: audioEngine.mainMixerNode, format: speechFormat)
+        audioEngine.attach(speakerMixer)
+        audioEngine.attach(micMixer)
+        audioEngine.connect(node, to: speakerMixer, format: speechFormat)
+        audioEngine.connect(speakerMixer, to: audioEngine.mainMixerNode, format: speechFormat)
+        // microphoneInputNode is attached but not connected (prepared for future TX)
         
         // Determine the modem input source: local device (mic/USB) or IC-705 WiFi.
         let inputSource = RadioSettings.audioInputSource
@@ -1527,6 +1548,20 @@ class AudioManager: ObservableObject {
 
         do {
             try audioEngine.start()
+
+            // Apply user speaker output preference, then re-apply the transceiver
+            // input because overrideOutputAudioPort(.speaker) also changes input
+            // to built-in mic.  Re-setting preferredInput restores the transceiver
+            // input when the two devices are compatible with the route.
+            if AudioManager.userSpeakerOutputId == "speaker" {
+                try? session.overrideOutputAudioPort(.speaker)
+                if let preferred = session.preferredInput {
+                    try? session.setPreferredInput(preferred)
+                    appLog("User speaker → Built-in Speaker, re-applied transceiver input: \(preferred.portName)")
+                } else {
+                    appLog("User speaker → Built-in Speaker")
+                }
+            }
 
             // Start background health check to detect and recover from engine stalls
             startHealthCheckTimer()
@@ -1597,10 +1632,18 @@ class AudioManager: ObservableObject {
 
         audioEngine.stop()
         
-        // Detach source node
+        // Detach source and user audio nodes
         if let node = sourceNode {
             audioEngine.detach(node)
             sourceNode = nil
+        }
+        if let node = speakerOutputNode {
+            audioEngine.detach(node)
+            speakerOutputNode = nil
+        }
+        if let node = microphoneInputNode {
+            audioEngine.detach(node)
+            microphoneInputNode = nil
         }
         
         // Clear speech ring buffer
