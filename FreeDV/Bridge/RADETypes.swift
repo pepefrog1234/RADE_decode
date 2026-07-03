@@ -46,6 +46,18 @@ class RADEWrapper {
         // No-op on simulator
     }
 
+    func txReset() {
+        // No-op on simulator
+    }
+
+    func txProcessSpeechSamples(_ pcm16k: UnsafePointer<Int16>, count: Int32) -> [Int16]? {
+        return nil
+    }
+
+    func txEndOfOver(callsign: String?) -> [Int16] {
+        return []
+    }
+
     func resetDeferredFeatures() {
         // No-op on simulator
     }
@@ -118,6 +130,25 @@ class RADEWrapper {
     }
     private var pendingEooResults: [EooDecodeResult] = []
 
+    // MARK: - TX (Transmit) State
+
+    /// LPCNet encoder state for extracting speech features (TX).
+    private var lpcnetEncState: OpaquePointer?
+    /// CPU arch selector for LPCNet feature extraction.
+    private var opusArch: Int32 = 0
+    /// Accumulates 16 kHz Int16 mic samples until a 160-sample frame is ready.
+    private var txPcmAccum: [Int16] = []
+    /// Accumulates LPCNet feature frames until a full rade_tx() input is ready.
+    private var txFeatureAccum: [Float] = []
+    /// Number of feature frames consumed by one rade_tx() call.
+    private var txFramesPerModemFrame = 0
+    /// Scratch buffer for rade_tx() modem output.
+    private var txOutBuf: [RADE_COMP] = []
+    /// Scratch buffer for rade_tx_eoo() modem output.
+    private var txEooBuf: [RADE_COMP] = []
+    /// EOO soft-decision bits (+/-1 floats).
+    private var eooBits: [Float] = []
+
     // Callbacks
 
     /// Called when decoded speech audio is available (16kHz int16 PCM)
@@ -170,7 +201,22 @@ class RADEWrapper {
         warmupBuffer = [Float](repeating: 0,
                                count: farganWarmupFrames * Int(NB_TOTAL_FEATURES))
 
-        appLog("RADEWrapper: initialized, ninMax=\(ninMax) nFeatures=\(nFeaturesInOut)")
+        // Initialize LPCNet encoder + TX buffers (transmit path).
+        opusArch = freedv_opus_select_arch()
+        lpcnetEncState = lpcnet_encoder_create()
+        if let enc = lpcnetEncState {
+            lpcnet_encoder_init(enc)
+        } else {
+            appLog("RADEWrapper: lpcnet_encoder_create() failed — TX disabled")
+        }
+        txFramesPerModemFrame = max(1, nFeaturesInOut / Int(NB_TOTAL_FEATURES))
+        txOutBuf = [RADE_COMP](repeating: RADE_COMP(real: 0, imag: 0),
+                               count: max(Int(rade_n_tx_out(r)), 1))
+        txEooBuf = [RADE_COMP](repeating: RADE_COMP(real: 0, imag: 0),
+                               count: max(Int(rade_n_tx_eoo_out(r)), 1))
+        eooBits = [Float](repeating: 0, count: max(nEooBits, 1))
+
+        appLog("RADEWrapper: initialized, ninMax=\(ninMax) nFeatures=\(nFeaturesInOut) txOut=\(txOutBuf.count) txEoo=\(txEooBuf.count) framesPerTx=\(txFramesPerModemFrame)")
     }
 
     deinit {
@@ -181,6 +227,11 @@ class RADEWrapper {
 
         farganState?.deallocate()
         farganState = nil
+
+        if let enc = lpcnetEncState {
+            lpcnet_encoder_destroy(enc)
+            lpcnetEncState = nil
+        }
     }
 
     // MARK: - RX (Receive)
@@ -501,6 +552,84 @@ class RADEWrapper {
     /// Clear accumulated RX input samples so stale data doesn't carry over between sessions.
     func clearInputBuffer() {
         rxInputBuffer.removeAll(keepingCapacity: true)
+    }
+
+    // MARK: - TX (Transmit)
+
+    /// Reset the transmit encoder + accumulators. Call before each over.
+    func txReset() {
+        if let enc = lpcnetEncState { lpcnet_encoder_init(enc) }
+        txPcmAccum.removeAll(keepingCapacity: true)
+        txFeatureAccum.removeAll(keepingCapacity: true)
+    }
+
+    /// Feed 16 kHz mono Int16 speech samples. Returns any RADE modem samples
+    /// (8 kHz Int16, real waveform) produced this call, or nil if none yet.
+    func txProcessSpeechSamples(_ pcm16k: UnsafePointer<Int16>, count: Int32) -> [Int16]? {
+        guard let r = radePtr, let enc = lpcnetEncState else { return nil }
+        let frameSize = Int(LPCNET_FRAME_SIZE)  // 160 samples @ 16 kHz (10 ms)
+        let featWidth = Int(NB_TOTAL_FEATURES)
+
+        for i in 0..<Int(count) { txPcmAccum.append(pcm16k[i]) }
+
+        var modemOut: [Int16] = []
+
+        // Extract features one 160-sample frame at a time.
+        while txPcmAccum.count >= frameSize {
+            var features = [Float](repeating: 0, count: featWidth)
+            txPcmAccum.withUnsafeBufferPointer { pcmBuf in
+                _ = features.withUnsafeMutableBufferPointer { featBuf in
+                    lpcnet_compute_single_frame_features(enc, pcmBuf.baseAddress, featBuf.baseAddress, opusArch)
+                }
+            }
+            txPcmAccum.removeFirst(frameSize)
+            txFeatureAccum.append(contentsOf: features)
+
+            // Once we have enough feature frames, run one modem frame.
+            let neededFloats = txFramesPerModemFrame * featWidth
+            while txFeatureAccum.count >= neededFloats {
+                var featIn = Array(txFeatureAccum.prefix(neededFloats))
+                txFeatureAccum.removeFirst(neededFloats)
+                let n = featIn.withUnsafeMutableBufferPointer { fb in
+                    txOutBuf.withUnsafeMutableBufferPointer { tb in
+                        rade_tx(r, tb.baseAddress, fb.baseAddress)
+                    }
+                }
+                appendModemSamples(from: txOutBuf, count: Int(n), into: &modemOut)
+            }
+        }
+        return modemOut.isEmpty ? nil : modemOut
+    }
+
+    /// Produce the End-Of-Over modem samples, optionally carrying a callsign.
+    func txEndOfOver(callsign: String?) -> [Int16] {
+        guard let r = radePtr else { return [] }
+        if let callsign, !callsign.isEmpty, nEooBits > 0 {
+            callsign.withCString { cs in
+                eooBits.withUnsafeMutableBufferPointer { bits in
+                    eoo_callsign_encode(cs, bits.baseAddress, Int32(nEooBits))
+                }
+            }
+            eooBits.withUnsafeMutableBufferPointer { bits in
+                rade_tx_set_eoo_bits(r, bits.baseAddress)
+            }
+        }
+        let n = txEooBuf.withUnsafeMutableBufferPointer { tb in
+            rade_tx_eoo(r, tb.baseAddress)
+        }
+        var out: [Int16] = []
+        appendModemSamples(from: txEooBuf, count: Int(n), into: &out)
+        return out
+    }
+
+    /// Convert RADE_COMP modem samples (real waveform) to clamped Int16.
+    private func appendModemSamples(from buf: [RADE_COMP], count: Int, into out: inout [Int16]) {
+        guard count > 0 else { return }
+        out.reserveCapacity(out.count + count)
+        for i in 0..<min(count, buf.count) {
+            let v = buf[i].real * 32767.0
+            out.append(Int16(max(-32768.0, min(32767.0, v))))
+        }
     }
 
     // MARK: - Status

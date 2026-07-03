@@ -227,7 +227,10 @@ class ReceptionLogger {
         if Thread.isMainThread {
             saveWork()
         } else {
-            DispatchQueue.main.sync(execute: saveWork)
+            // Never block worker queues waiting for the main queue.
+            // This avoids stop/finalize deadlocks when the user taps STOP
+            // while a session is being persisted.
+            DispatchQueue.main.async(execute: saveWork)
         }
     }
     

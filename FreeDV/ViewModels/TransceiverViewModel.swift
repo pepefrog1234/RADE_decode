@@ -28,6 +28,10 @@ class TransceiverViewModel: ObservableObject {
     
     private let audioManager = AudioManager()
     private let deviceManager = AudioDeviceManager()
+
+    /// IC-705 WiFi radio controller (injected from the shared instance so the
+    /// Settings and Receiver tabs drive the same connection).
+    private(set) var radioController: IcomRadioController?
     
     /// FreeDV Reporter integration — set from the view layer.
     var reporter: FreeDVReporter? {
@@ -72,6 +76,19 @@ class TransceiverViewModel: ObservableObject {
     // Recording state
     @Published var isRecording = false
 
+    // IC-705 radio state (mirrored from radioController each tick)
+    @Published var radioConnected = false
+    @Published var radioConnecting = false
+    @Published var radioStatusText = ""
+    @Published var radioName = ""
+    @Published var radioFrequencyHz: UInt64 = 0
+    @Published var radioMode: RadioMode = .usb
+    @Published var radioDataMode = false
+    @Published var radioIsTransmitting = false
+
+    /// Whether the IC-705 WiFi source is selected in settings.
+    var usingRadioSource: Bool { RadioSettings.audioInputSource == .icomRadio }
+
     // Background decode health indicator
     @Published var backgroundHealthText: String = ""
     @Published var backgroundHealthIsHealthy: Bool = false
@@ -98,6 +115,13 @@ class TransceiverViewModel: ObservableObject {
     init() {
         setupBindings()
         observeAppLifecycle()
+    }
+
+    /// Inject the shared radio controller and wire it into the audio manager.
+    func attachRadioController(_ controller: IcomRadioController) {
+        guard radioController == nil else { return }
+        radioController = controller
+        audioManager.radioController = controller
     }
 
     @MainActor deinit {
@@ -169,6 +193,18 @@ class TransceiverViewModel: ObservableObject {
                     self.currentOutputDevice = self.deviceManager.currentOutputName
                 }
                 self.isRecording = self.audioManager.wavRecorder != nil
+
+                // Mirror IC-705 radio state for the UI.
+                if let radio = self.radioController {
+                    self.radioConnected = radio.isConnected
+                    if case .connecting = radio.connectionState { self.radioConnecting = true } else { self.radioConnecting = false }
+                    self.radioStatusText = radio.statusText
+                    self.radioName = radio.radioName
+                    self.radioFrequencyHz = radio.frequencyHz
+                    self.radioMode = radio.mode
+                    self.radioDataMode = radio.dataMode
+                    self.radioIsTransmitting = radio.isTransmitting
+                }
                 self.deferredDecodeInProgress = self.audioManager.deferredDecodeInProgress
                 self.deferredDecodeProgress = self.audioManager.deferredDecodeProgress
                 self.deferredDecodeStatusText = self.audioManager.deferredDecodeStatusText
@@ -201,6 +237,25 @@ class TransceiverViewModel: ObservableObject {
         } else {
             startTransceiver()
         }
+    }
+
+    // MARK: - IC-705 Radio Actions
+
+    func connectRadio() { radioController?.connect() }
+    func disconnectRadio() { radioController?.disconnect() }
+
+    func tuneRadio(toHz hz: UInt64) { radioController?.setFrequency(hz) }
+    func setRadioMode(_ mode: RadioMode) { radioController?.setMode(mode) }
+
+    /// Push-to-talk down: begin FreeDV transmit.
+    func pttDown() {
+        guard radioConnected else { return }
+        audioManager.startTX()
+    }
+
+    /// Push-to-talk up: stop FreeDV transmit.
+    func pttUp() {
+        audioManager.stopTX()
     }
 
     func toggleDeferredDecodePause() {

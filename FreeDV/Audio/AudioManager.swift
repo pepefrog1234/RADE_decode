@@ -103,6 +103,30 @@ class AudioManager: ObservableObject {
     
     // FreeDV Reporter integration
     var reporter: FreeDVReporter?
+
+    // MARK: - IC-705 WiFi integration
+
+    /// Radio controller (set by the view model). Used for network RX/TX audio.
+    var radioController: IcomRadioController?
+
+    /// True while transmitting FreeDV to the radio (half-duplex).
+    @Published var isTransmitting = false
+
+    /// 16 kHz mono Int16 format for LPCNet feature extraction (TX speech input).
+    private let txSpeechFormat = AVAudioFormat(
+        commonFormat: .pcmFormatInt16,
+        sampleRate: 16000,
+        channels: 1,
+        interleaved: true
+    )!
+    private var txMonoFormat: AVAudioFormat?
+    private var txConverter: AVAudioConverter?
+    private var txTapInstalled = false
+    private let txQueue = DispatchQueue(label: "com.freedv.rade.tx", qos: .userInitiated)
+    // TX diagnostics
+    private var txMicBufferCount = 0
+    private var txModemSampleTotal = 0
+    private var txPacketCount = 0
     
     // GPS tracking for reception log
     let locationTracker = LocationTracker()
@@ -778,6 +802,9 @@ class AudioManager: ObservableObject {
     /// Recover RX pipeline when watchdog detects stale input/frame activity.
     /// This handles cases where old devices keep engine alive but input tap stops delivering.
     private func recoverRXPipelineIfNeeded(reason: String) {
+        // Don't disturb the pipeline while transmitting — TX owns the input tap
+        // and restarting the engine would kill the outgoing audio.
+        guard !isTransmitting else { return }
         let now = Date()
         processingBackpressureLock.lock()
         if let last = lastRxRecoveryDate, now.timeIntervalSince(last) < rxRecoveryCooldown {
@@ -898,7 +925,10 @@ class AudioManager: ObservableObject {
     }
     
     /// Foreground RX isolation mode is fixed on for best decode stability.
+    /// Disabled for IC-705 network RX — there is no mic-to-speaker feedback
+    /// path, so decoded speech should play out the phone speaker.
     private func isForegroundRxIsolationEnabled() -> Bool {
+        if RadioSettings.audioInputSource == .icomRadio { return false }
         return !backgroundMode
     }
     #endif
@@ -1322,6 +1352,10 @@ class AudioManager: ObservableObject {
 
     private func installInputTapIfNeeded(with inputFormat: AVAudioFormat) {
         guard !isInputTapInstalled else { return }
+        // Never install the RX tap while transmitting (TX owns bus 0's tap), or
+        // in IC-705 mode where modem audio arrives over the network, not the mic.
+        guard !txTapInstalled, !isTransmitting else { return }
+        if RadioSettings.audioInputSource == .icomRadio { return }
 
         // Validate format — inputNode.outputFormat can return 0 channels / 0 Hz
         // when the audio session isn't fully ready or the route changed.
@@ -1419,33 +1453,47 @@ class AudioManager: ObservableObject {
         audioEngine.attach(node)
         audioEngine.connect(node, to: audioEngine.mainMixerNode, format: speechFormat)
         
-        // Capture modem signal from mic / audio input
-        // inputNode native format is typically 48 kHz with measurement mode
-        var inputFormat = inputNode.outputFormat(forBus: 0)
-        appLog("Audio input format: \(inputFormat)")
-        appLog("Input channels: \(inputFormat.channelCount), sampleRate: \(inputFormat.sampleRate)")
-        
-        // Guard against invalid format — can happen when audio route changes or
-        // session isn't fully ready. Re-activate and retry once.
-        if inputFormat.channelCount == 0 || inputFormat.sampleRate == 0 {
-            appLog("WARN: invalid input format — re-activating session and retrying")
-            #if os(iOS)
-            try? AVAudioSession.sharedInstance().setActive(false)
-            try? AVAudioSession.sharedInstance().setActive(true)
-            #endif
-            inputFormat = inputNode.outputFormat(forBus: 0)
-            appLog("Retry input format: ch=\(inputFormat.channelCount) sr=\(inputFormat.sampleRate)")
-            guard inputFormat.channelCount > 0, inputFormat.sampleRate > 0 else {
-                appLog("ERROR: input format still invalid after retry — cannot start RX")
-                return
+        // Determine the modem input source: local device (mic/USB) or IC-705 WiFi.
+        let inputSource = RadioSettings.audioInputSource
+        var deviceInputFormat: AVAudioFormat?
+
+        if inputSource == .device {
+            // Capture modem signal from mic / audio input.
+            // inputNode native format is typically 48 kHz with measurement mode.
+            var inputFormat = inputNode.outputFormat(forBus: 0)
+            appLog("Audio input format: \(inputFormat)")
+            appLog("Input channels: \(inputFormat.channelCount), sampleRate: \(inputFormat.sampleRate)")
+
+            // Guard against invalid format — can happen when audio route changes or
+            // session isn't fully ready. Re-activate and retry once.
+            if inputFormat.channelCount == 0 || inputFormat.sampleRate == 0 {
+                appLog("WARN: invalid input format — re-activating session and retrying")
+                #if os(iOS)
+                try? AVAudioSession.sharedInstance().setActive(false)
+                try? AVAudioSession.sharedInstance().setActive(true)
+                #endif
+                inputFormat = inputNode.outputFormat(forBus: 0)
+                appLog("Retry input format: ch=\(inputFormat.channelCount) sr=\(inputFormat.sampleRate)")
+                guard inputFormat.channelCount > 0, inputFormat.sampleRate > 0 else {
+                    appLog("ERROR: input format still invalid after retry — cannot start RX")
+                    return
+                }
             }
-        }
-        
-        // Set up RX sample rate converter from mono float → 8kHz int16
-        // This avoids a complex multi-step conversion (stereo→mono + 48kHz→8kHz + float→int16)
-        configureInputConverter(for: inputFormat)
-        if let monoFmt = monoFloatFormat {
-            appLog("RX converter: mono \(monoFmt.sampleRate)Hz Float32 → \(modemFormat.sampleRate)Hz Int16")
+
+            // Set up RX sample rate converter from mono float → 8kHz int16
+            // This avoids a complex multi-step conversion (stereo→mono + 48kHz→8kHz + float→int16)
+            configureInputConverter(for: inputFormat)
+            if let monoFmt = monoFloatFormat {
+                appLog("RX converter: mono \(monoFmt.sampleRate)Hz Float32 → \(modemFormat.sampleRate)Hz Int16")
+            }
+            deviceInputFormat = inputFormat
+        } else {
+            // IC-705 WiFi: modem audio arrives over the network at 8 kHz and is
+            // fed directly to RADE. No mic tap or converter needed.
+            appLog("RX source: IC-705 WiFi (network audio → RADE)")
+            radioController?.onRxAudio = { [weak self] samples in
+                self?.feedRadioRxSamples(samples)
+            }
         }
 
         shouldProcess = true
@@ -1467,16 +1515,18 @@ class AudioManager: ObservableObject {
             self.autoLowLoadModeActive = false
         }
         deferredSampleStore.reset()
-        installInputTapIfNeeded(with: inputFormat)
-        
+        if let inputFormat = deviceInputFormat {
+            installInputTapIfNeeded(with: inputFormat)
+        }
+
         do {
             try audioEngine.start()
-            
+
             // Start background health check to detect and recover from engine stalls
             startHealthCheckTimer()
-            
+
             // Store sample rate for sub-session creation and reset sync tracker
-            currentSampleRate = Int(inputFormat.sampleRate)
+            currentSampleRate = deviceInputFormat.map { Int($0.sampleRate) } ?? 8000
             previousRxSyncInt = 0
             sessionActive = false
             
@@ -1521,13 +1571,21 @@ class AudioManager: ObservableObject {
         }
         if !keepDeferredReplayRunning {
             deferredSampleStore.reset()
-            // Ensure deferred replay work has observed cancellation before teardown.
-            // Without this, STOP can race with foreground replay and hit RADE state conflicts.
-            deferredDecodeQueue.sync {}
+            // Avoid blocking the main thread here. A sync wait can deadlock if
+            // deferred decode is concurrently dispatching save work to main.
+            deferredDecodeQueue.async {}
         }
         
         // Stop health monitoring
         stopHealthCheckTimer()
+
+        // Tear down TX + IC-705 network RX hooks.
+        if isTransmitting {
+            removeTxTap()
+            radioController?.setPTT(false)
+            DispatchQueue.main.async { self.isTransmitting = false }
+        }
+        radioController?.onRxAudio = nil
 
         removeInputTapIfInstalled()
 
@@ -1591,8 +1649,169 @@ class AudioManager: ObservableObject {
         }
     }
     
+    // MARK: - TX (Transmit FreeDV to IC-705)
+
+    /// Begin transmitting FreeDV: switch the radio to USB-D, key PTT, and start
+    /// capturing mic audio → LPCNet → RADE → WiFi audio stream. Half-duplex:
+    /// RX decoding is paused while transmitting.
+    func startTX() {
+        guard let radio = radioController, radio.isConnected else {
+            appLog("TX: no radio connection — ignoring")
+            return
+        }
+        guard !isTransmitting else { return }
+        appLog("TX: starting FreeDV transmit (engineRunning=\(audioEngine.isRunning) isRunning=\(isRunning))")
+        txMicBufferCount = 0
+        txModemSampleTotal = 0
+        txPacketCount = 0
+
+        if !audioEngine.isRunning {
+            appLog("TX: audio engine not running — starting it for mic capture")
+            #if os(iOS)
+            let session = AVAudioSession.sharedInstance()
+            try? session.setCategory(preferredSessionCategoryForCurrentState(),
+                                     mode: preferredSessionModeForCurrentState(),
+                                     options: preferredSessionOptionsForCurrentState())
+            try? session.setActive(true)
+            #endif
+            do {
+                try audioEngine.start()
+            } catch {
+                appLog("TX: failed to start audio engine (\(error)) — aborting TX")
+                return
+            }
+        }
+
+        setRealtimeDecodePaused(true)
+        radeWrapper.txReset()
+        radio.configureForFreeDVTransmit()
+        radio.setPTT(true)
+
+        let inputFormat = inputNode.outputFormat(forBus: 0)
+        guard inputFormat.channelCount > 0, inputFormat.sampleRate > 0 else {
+            appLog("TX: invalid mic format — aborting")
+            radio.setPTT(false)
+            setRealtimeDecodePaused(false)
+            return
+        }
+        if let monoFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                       sampleRate: inputFormat.sampleRate,
+                                       channels: 1, interleaved: true) {
+            txMonoFormat = monoFmt
+            txConverter = AVAudioConverter(from: monoFmt, to: txSpeechFormat)
+        }
+        appLog("TX: mic format ch=\(inputFormat.channelCount) sr=\(inputFormat.sampleRate) → 16kHz Int16")
+        installTxTap(inputFormat: inputFormat)
+        DispatchQueue.main.async { self.isTransmitting = true }
+    }
+
+    /// Stop transmitting: flush the End-Of-Over frame, unkey PTT, resume RX.
+    func stopTX() {
+        guard isTransmitting else { return }
+        appLog("TX: stopping FreeDV transmit")
+        removeTxTap()
+
+        let callsign = UserDefaults.standard.string(forKey: "reporter_callsign")
+        let radio = radioController
+        txQueue.async { [weak self] in
+            guard let self = self else { return }
+            let eoo = self.radeWrapper.txEndOfOver(callsign: callsign)
+            if !eoo.isEmpty { self.sendTxModemSamples(eoo) }
+            // Let the trailing audio drain before unkeying.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                radio?.setPTT(false)
+                self.setRealtimeDecodePaused(false)
+                self.isTransmitting = false
+            }
+        }
+    }
+
+    private func installTxTap(inputFormat: AVAudioFormat) {
+        guard inputFormat.channelCount > 0, inputFormat.sampleRate > 0 else {
+            appLog("TX: invalid mic format — cannot install tap")
+            return
+        }
+        // installTap asserts if a tap already exists on the bus. Clear any tap
+        // (RX tap or one installed by the RX watchdog) first. removeTap is a
+        // safe no-op when none is installed.
+        inputNode.removeTap(onBus: 0)
+        isInputTapInstalled = false
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
+            self?.processTXInput(buffer: buffer)
+        }
+        txTapInstalled = true
+    }
+
+    private func removeTxTap() {
+        guard txTapInstalled else { return }
+        inputNode.removeTap(onBus: 0)
+        txTapInstalled = false
+    }
+
+    /// Mic buffer → 16 kHz mono Int16 → LPCNet + RADE TX → WiFi modem samples.
+    private func processTXInput(buffer: AVAudioPCMBuffer) {
+        guard let converter = txConverter, let monoFmt = txMonoFormat else { return }
+        let inputFrames = Int(buffer.frameLength)
+        guard inputFrames > 0, let floatData = buffer.floatChannelData else { return }
+
+        guard let monoBuffer = AVAudioPCMBuffer(pcmFormat: monoFmt,
+                                                frameCapacity: AVAudioFrameCount(inputFrames)) else { return }
+        monoBuffer.frameLength = AVAudioFrameCount(inputFrames)
+        guard let monoData = monoBuffer.floatChannelData?[0] else { return }
+        // Channel 0 (mono or left).
+        memcpy(monoData, floatData[0], inputFrames * MemoryLayout<Float>.size)
+
+        let outFrames = AVAudioFrameCount(Double(inputFrames) * 16000.0 / buffer.format.sampleRate)
+        guard outFrames > 0,
+              let converted = AVAudioPCMBuffer(pcmFormat: txSpeechFormat, frameCapacity: outFrames) else { return }
+        var consumed = false
+        var error: NSError?
+        _ = converter.convert(to: converted, error: &error) { _, outStatus in
+            if consumed { outStatus.pointee = .noDataNow; return nil }
+            consumed = true
+            outStatus.pointee = .haveData
+            return monoBuffer
+        }
+        guard error == nil, let ch = converted.int16ChannelData else { return }
+        let count = Int(converted.frameLength)
+        guard count > 0 else { return }
+        let copy = Array(UnsafeBufferPointer(start: ch[0], count: count))
+
+        txQueue.async { [weak self] in
+            guard let self = self, self.isTransmitting else { return }
+            self.txMicBufferCount += 1
+            let modem = copy.withUnsafeBufferPointer { buf -> [Int16]? in
+                guard let ptr = buf.baseAddress else { return nil }
+                return self.radeWrapper.txProcessSpeechSamples(ptr, count: Int32(count))
+            }
+            var modemPeak: Int16 = 0
+            if let modem = modem, !modem.isEmpty {
+                self.txModemSampleTotal += modem.count
+                for s in modem { let a = s == Int16.min ? Int16.max : abs(s); if a > modemPeak { modemPeak = a } }
+                self.sendTxModemSamples(modem)
+            }
+            // Periodic TX diagnostic (~every 25 mic buffers).
+            if self.txMicBufferCount % 25 == 0 {
+                appLog("TX: micBuffers=\(self.txMicBufferCount) modemSamples=\(self.txModemSampleTotal) packets=\(self.txPacketCount) modemPeak=\(modemPeak)/32767")
+            }
+        }
+    }
+
+    /// Send modem samples to the radio in ~20 ms chunks (160 samples @ 8 kHz).
+    private func sendTxModemSamples(_ samples: [Int16]) {
+        guard let radio = radioController else { return }
+        let chunk = 160
+        var i = 0
+        while i < samples.count {
+            let end = min(i + chunk, samples.count)
+            radio.sendTxAudio(Array(samples[i..<end]))
+            txPacketCount += 1
+            i = end
+        }
+    }
+
     // MARK: - RX Processing
-    
+
     private func processRXInput(buffer: AVAudioPCMBuffer) {
         processingBackpressureLock.lock()
         lastRxInputCallbackDate = Date()
@@ -1698,9 +1917,27 @@ class AudioManager: ObservableObject {
             appLog("8kHz convert: frames=\(convertedCount) peak=\(peak16) samples=[\(s0), \(s1), \(s2)]")
         }
         
+        feedModemSamples(channelData[0], count: convertedCount, needsRawCapture: needsRawCapture)
+    }
+
+    /// Feed 8 kHz mono Int16 modem samples from an RX stream from the IC-705
+    /// (WiFi). Copies the samples and routes them through the shared decode path.
+    func feedRadioRxSamples(_ samples: [Int16]) {
+        guard shouldProcess else { return }
+        processingBackpressureLock.lock()
+        lastRxInputCallbackDate = Date()
+        processingBackpressureLock.unlock()
+        samples.withUnsafeBufferPointer { buf in
+            guard let ptr = buf.baseAddress else { return }
+            feedModemSamples(ptr, count: buf.count, needsRawCapture: backgroundMode && backgroundRawSampleCaptureEnabled)
+        }
+    }
+
+    /// Shared modem-sample entry point used by both the device mic tap and the
+    /// IC-705 network RX stream. Input is 8 kHz mono Int16.
+    private func feedModemSamples(_ samples: UnsafePointer<Int16>, count convertedCount: Int, needsRawCapture: Bool) {
         // Calculate input level for meter (throttled to ~10 Hz)
         // Skip in background — no one can see the meters
-        let samples = channelData[0]
         if !backgroundMode {
             inputLevelCounter += 1
             if inputLevelCounter >= 5 {

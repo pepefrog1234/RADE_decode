@@ -4,13 +4,15 @@ import Combine
 
 struct ContentView: View {
     @State private var reporter = FreeDVReporter()
+    /// Shared IC-705 controller — same instance drives the Receiver and Settings tabs.
+    @StateObject private var radioController = IcomRadioController()
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = false
     @State private var showOnboarding = false
     
     var body: some View {
         TabView {
-            TransceiverView(reporter: reporter)
+            TransceiverView(reporter: reporter, radioController: radioController)
                 .tabItem {
                     Label("Receiver", systemImage: "antenna.radiowaves.left.and.right")
                 }
@@ -33,7 +35,7 @@ struct ContentView: View {
             }
             
             NavigationStack {
-                SettingsView(reporter: reporter)
+                SettingsView(reporter: reporter, radioController: radioController)
             }
             .tabItem {
                 Label("Settings", systemImage: "gear")

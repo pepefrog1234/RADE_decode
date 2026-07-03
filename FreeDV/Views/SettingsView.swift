@@ -7,6 +7,7 @@ import Combine
 /// Settings page for audio device selection and app configuration.
 struct SettingsView: View {
     @Bindable var reporter: FreeDVReporter
+    @ObservedObject var radioController: IcomRadioController
     @StateObject private var deviceManager = AudioDeviceManager()
     @StateObject private var locationHelper = LocationHelper()
     @AppStorage("fftEnabledPreference") private var fftEnabledPreference = true
@@ -91,6 +92,9 @@ struct SettingsView: View {
                 }
             }
             
+            // IC-705 WiFi radio
+            RadioSettingsSection(radio: radioController)
+
             // Audio devices section
             Section("Transceiver Audio Devices") {
                 #if os(iOS)
@@ -625,8 +629,110 @@ private struct LicenseRow: View {
     }
 }
 
+// MARK: - IC-705 WiFi Settings
+
+struct RadioSettingsSection: View {
+    @ObservedObject var radio: IcomRadioController
+
+    @AppStorage("audioInputSource") private var audioSourceRaw = AudioInputSource.device.rawValue
+    @AppStorage("radioHost") private var host = RadioSettings.defaultHost
+    @AppStorage("radioControlPort") private var controlPort = Int(RadioSettings.defaultControlPort)
+    @AppStorage("radioUsername") private var username = ""
+    @AppStorage("radioEnableTx") private var enableTx = true
+    @State private var password = ""
+
+    private var radioSelected: Bool { audioSourceRaw == AudioInputSource.icomRadio.rawValue }
+
+    var body: some View {
+        Section("Radio (IC-705 WiFi)") {
+            Picker("Audio Source", selection: $audioSourceRaw) {
+                Text("Device (Mic / USB)").tag(AudioInputSource.device.rawValue)
+                Text("IC-705 WiFi").tag(AudioInputSource.icomRadio.rawValue)
+            }
+
+            if radioSelected {
+                HStack {
+                    Text("Radio IP")
+                    Spacer()
+                    TextField("192.168.0.1", text: $host)
+                        .keyboardType(.numbersAndPunctuation)
+                        .autocorrectionDisabled()
+                        .multilineTextAlignment(.trailing)
+                        .frame(maxWidth: 160)
+                }
+                HStack {
+                    Text("Control Port")
+                    Spacer()
+                    TextField("50001", value: $controlPort, format: .number.grouping(.never))
+                        .keyboardType(.numberPad)
+                        .multilineTextAlignment(.trailing)
+                        .frame(maxWidth: 100)
+                }
+                HStack {
+                    Text("Username")
+                    Spacer()
+                    TextField("radio username", text: $username)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .multilineTextAlignment(.trailing)
+                        .frame(maxWidth: 180)
+                }
+                HStack {
+                    Text("Password")
+                    Spacer()
+                    SecureField("radio password", text: $password)
+                        .multilineTextAlignment(.trailing)
+                        .frame(maxWidth: 180)
+                        .onChange(of: password) { _, newValue in
+                            RadioSettings.password = newValue
+                        }
+                }
+                Toggle("Enable Transmit", isOn: $enableTx)
+
+                HStack {
+                    Text("Connection")
+                    Spacer()
+                    HStack(spacing: 4) {
+                        Circle()
+                            .fill(radio.isConnected ? .green : (isConnecting ? .yellow : .gray))
+                            .frame(width: 8, height: 8)
+                        Text(statusText)
+                            .foregroundStyle(.secondary)
+                            .font(.subheadline)
+                    }
+                }
+                if radio.isConnected && !radio.radioName.isEmpty {
+                    LabeledContent("Radio", value: radio.radioName)
+                }
+
+                Button(radio.isConnected ? "Disconnect" : "Connect") {
+                    if radio.isConnected {
+                        radio.disconnect()
+                    } else {
+                        radio.connect()
+                    }
+                }
+                .disabled(isConnecting || username.isEmpty)
+            }
+        }
+        .onAppear { password = RadioSettings.password }
+    }
+
+    private var isConnecting: Bool {
+        if case .connecting = radio.connectionState { return true }
+        return false
+    }
+
+    private var statusText: String {
+        if radio.isConnected { return "Connected" }
+        if isConnecting { return "Connecting…" }
+        if !radio.statusText.isEmpty { return radio.statusText }
+        return "Disconnected"
+    }
+}
+
 #Preview {
     NavigationStack {
-        SettingsView(reporter: FreeDVReporter())
+        SettingsView(reporter: FreeDVReporter(), radioController: IcomRadioController())
     }
 }

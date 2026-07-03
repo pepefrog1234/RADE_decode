@@ -5,6 +5,7 @@ import CoreLocation
 /// Main transceiver UI — professional ham radio interface with dark theme.
 struct TransceiverView: View {
     var reporter: FreeDVReporter
+    var radioController: IcomRadioController
     @StateObject private var viewModel = TransceiverViewModel()
     @Environment(\.modelContext) private var modelContext
     @State private var isOutdoorMode = false
@@ -112,7 +113,14 @@ struct TransceiverView: View {
                         }
                         
                         Spacer()
-                        
+
+                        // IC-705 radio control (frequency / mode / PTT)
+                        if viewModel.usingRadioSource {
+                            RadioControlPanel(viewModel: viewModel)
+                                .padding(.horizontal, 16)
+                                .padding(.bottom, 8)
+                        }
+
                         // Bottom control area: Start/Stop
                         BottomControls(viewModel: viewModel)
                             .padding(.horizontal, 16)
@@ -160,10 +168,81 @@ struct TransceiverView: View {
             }
             .preferredColorScheme(.dark)
             .onAppear {
+                viewModel.attachRadioController(radioController)
                 viewModel.configureLogger(modelContainer: modelContext.container)
                 viewModel.reporter = reporter
             }
         }
+    }
+}
+
+// MARK: - Radio Control Panel (IC-705)
+
+/// Frequency / mode display + push-to-talk for the connected IC-705.
+struct RadioControlPanel: View {
+    @ObservedObject var viewModel: TransceiverViewModel
+    @State private var pttActive = false
+
+    private var freqText: String {
+        guard viewModel.radioFrequencyHz > 0 else { return "—" }
+        let mhz = Double(viewModel.radioFrequencyHz) / 1_000_000.0
+        return String(format: "%.4f MHz", mhz)
+    }
+
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack {
+                // Connection state
+                Circle()
+                    .fill(viewModel.radioConnected ? .green : (viewModel.radioConnecting ? .yellow : .gray))
+                    .frame(width: 8, height: 8)
+                Text(viewModel.radioConnected ? (viewModel.radioName.isEmpty ? "IC-705" : viewModel.radioName)
+                                              : (viewModel.radioConnecting ? "Connecting…" : "Not connected"))
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(freqText)
+                    .font(.system(size: 16, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.white)
+                Text("\(viewModel.radioMode.description)\(viewModel.radioDataMode ? "-D" : "")")
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.cyan)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.cyan.opacity(0.15))
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+            }
+
+            // Push-to-talk
+            Text(viewModel.radioIsTransmitting ? "TRANSMITTING" : "HOLD TO TALK")
+                .font(.system(size: 15, weight: .bold, design: .monospaced))
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 16)
+                .background(viewModel.radioIsTransmitting ? Color.red : Color(white: 0.2))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(viewModel.radioIsTransmitting ? Color.red : Color.white.opacity(0.15), lineWidth: 1)
+                )
+                .opacity(viewModel.radioConnected && viewModel.isRunning ? 1 : 0.4)
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { _ in
+                            guard !pttActive, viewModel.radioConnected, viewModel.isRunning else { return }
+                            pttActive = true
+                            viewModel.pttDown()
+                        }
+                        .onEnded { _ in
+                            guard pttActive else { return }
+                            pttActive = false
+                            viewModel.pttUp()
+                        }
+                )
+        }
+        .padding(12)
+        .background(Color.white.opacity(0.04))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 }
 
@@ -670,5 +749,5 @@ private func formatETA(_ seconds: Double) -> String {
 }
 
 #Preview {
-    TransceiverView(reporter: FreeDVReporter())
+    TransceiverView(reporter: FreeDVReporter(), radioController: IcomRadioController())
 }
