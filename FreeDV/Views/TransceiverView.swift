@@ -9,6 +9,11 @@ struct TransceiverView: View {
     @StateObject private var viewModel = TransceiverViewModel()
     @Environment(\.modelContext) private var modelContext
     @State private var isOutdoorMode = false
+    /// Waterfall is replaced by the reception-reports panel during TX, and
+    /// held a few seconds afterwards — callsign confirmations (EOO decodes
+    /// from other stations) mostly arrive right as the over ends.
+    @State private var showTxReports = false
+    @State private var txReportsHoldTask: Task<Void, Never>?
     
     var body: some View {
         NavigationStack {
@@ -43,9 +48,24 @@ struct TransceiverView: View {
                         .padding(.horizontal, 16)
                         .padding(.top, 4)
 
-                        // Spectrum + Waterfall stacked display
+                        // Spectrum + Waterfall stacked display; while
+                        // transmitting it becomes the reception-reports panel.
                         Group {
-                            if viewModel.effectiveFFTEnabled {
+                            if showTxReports {
+                                TxReportsView(reporter: reporter,
+                                              isTransmitting: viewModel.radioIsTransmitting)
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: geo.size.height * 0.40)
+                                    .background(Color.white.opacity(0.03))
+                                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 8)
+                                            .stroke(viewModel.radioIsTransmitting
+                                                    ? Color.red.opacity(0.4)
+                                                    : Color.white.opacity(0.1),
+                                                    lineWidth: 0.8)
+                                    )
+                            } else if viewModel.effectiveFFTEnabled {
                                 VStack(spacing: 1) {
                                     SpectrumView(fftData: viewModel.fftData)
                                         .frame(height: geo.size.height * 0.18)
@@ -171,6 +191,19 @@ struct TransceiverView: View {
                 viewModel.attachRadioController(radioController)
                 viewModel.configureLogger(modelContainer: modelContext.container)
                 viewModel.reporter = reporter
+            }
+            .onChange(of: viewModel.radioIsTransmitting) { _, transmitting in
+                txReportsHoldTask?.cancel()
+                if transmitting {
+                    withAnimation { showTxReports = true }
+                } else {
+                    // Hold the panel while post-over EOO reports come in.
+                    txReportsHoldTask = Task {
+                        try? await Task.sleep(for: .seconds(8))
+                        guard !Task.isCancelled else { return }
+                        withAnimation { showTxReports = false }
+                    }
+                }
             }
         }
     }
