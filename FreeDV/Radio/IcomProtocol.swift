@@ -255,15 +255,18 @@ func icomEncode(_ text: String) -> Data {
 // MARK: - Audio format descriptor
 
 /// Describes the PCM format negotiated for the radio audio stream.
-/// FreeDV defaults to 8 kHz / mono / 16-bit LPCM — exactly RADE's modem rate,
-/// so no resampling is needed on the network audio path.
+/// 48 kHz mono 16-bit LPCM — the IC-705's native rate, used by RS-BA1,
+/// kappanhang, and the proven-clean Android port of this app. Transmitting
+/// at 8 kHz makes the radio do its own (poor) sample-rate conversion and the
+/// signal splatters; instead IcomAudioStream converts 8 kHz ↔ 48 kHz itself
+/// with the same polyphase filters as the Android implementation.
 struct IcomAudioFormat {
     var rate: UInt16
     var channels: UInt8
     var size: UInt8       // bytes per sample (1 or 2)
     var uLaw: Bool
 
-    static let freeDVDefault = IcomAudioFormat(rate: 8000, channels: 1, size: 2, uLaw: false)
+    static let freeDVDefault = IcomAudioFormat(rate: 48000, channels: 1, size: 2, uLaw: false)
 
     var bytesPerFrame: UInt8 { channels * size }
 

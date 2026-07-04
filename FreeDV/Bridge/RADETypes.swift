@@ -623,12 +623,17 @@ class RADEWrapper {
     }
 
     /// Convert RADE_COMP modem samples (real waveform) to clamped Int16.
+    /// No filtering — RADE V1 must be transmitted unfiltered (per the
+    /// author); the waveform goes out exactly as rade_tx produced it.
+    /// Conversion mirrors the Android implementation byte-for-byte
+    /// (audio_engine.cpp: clamp ±0.999, scale 32767) so the radio needs the
+    /// same WLAN MOD Level setting on both platforms.
     private func appendModemSamples(from buf: [RADE_COMP], count: Int, into out: inout [Int16]) {
         guard count > 0 else { return }
         out.reserveCapacity(out.count + count)
         for i in 0..<min(count, buf.count) {
-            let v = buf[i].real * 32767.0
-            out.append(Int16(max(-32768.0, min(32767.0, v))))
+            let v = max(-0.999, min(0.999, buf[i].real)) * 32767.0
+            out.append(Int16(v))
         }
     }
 

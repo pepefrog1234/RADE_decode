@@ -274,4 +274,12 @@ final class IcomRadioController: ObservableObject {
         guard let audio else { return }
         audio.queue.async { audio.sendAudio(samples) }
     }
+
+    /// Mark the end of TX audio (PTT released, EOO + padding queued) so the
+    /// audio stream classifies the final FIFO drain as a normal flush — PTT
+    /// itself stays keyed for the drain period.
+    func noteTxAudioFlushing() {
+        streamsLock.lock(); let audio = audioStream; streamsLock.unlock()
+        audio?.queue.async { audio?.setTxActive(false) }
+    }
 }

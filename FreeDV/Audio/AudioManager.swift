@@ -130,6 +130,14 @@ class AudioManager: ObservableObject {
     private var txMonoFormat: AVAudioFormat?
     private var txConverter: AVAudioConverter?
     private var txTapInstalled = false
+    /// Debug aid: records the exact 16 kHz speech fed to the RADE encoder
+    /// (one fixed file, overwritten each over) so "wrong voice at the far
+    /// end" can be split into mic-capture vs modem problems by playback.
+    private var txSpeechRecorder: WAVRecorder?
+    /// Debug aid: records the 8 kHz modem waveform handed to the radio
+    /// (pre-pacing). Decoding this file with any RADE decoder is a zero-RF
+    /// loopback test of the whole TX chain.
+    private var txModemRecorder: WAVRecorder?
     private let txQueue = DispatchQueue(label: "com.freedv.rade.tx", qos: .userInitiated)
     // TX diagnostics
     private var txMicBufferCount = 0
@@ -938,7 +946,11 @@ class AudioManager: ObservableObject {
     #if os(iOS)
     /// Foreground modem decode prefers raw capture (`.measurement`).
     /// Background execution uses `.default` for better iOS reliability.
+    /// IC-705 network mode never captures the modem waveform from the mic, so
+    /// it always uses `.default` — `.measurement` disables the speaker
+    /// loudness profile and makes decoded speech noticeably quiet.
     private func preferredSessionModeForCurrentState() -> AVAudioSession.Mode {
+        if RadioSettings.audioInputSource == .icomRadio { return .default }
         return backgroundMode ? .default : .measurement
     }
     
@@ -1626,6 +1638,14 @@ class AudioManager: ObservableObject {
             removeTxTap()
             radioController?.setPTT(false)
             reporter?.reportTx(transmitting: false)
+            if let rec = txSpeechRecorder {
+                _ = rec.stop()
+                txSpeechRecorder = nil
+            }
+            if let rec = txModemRecorder {
+                _ = rec.stop()
+                txModemRecorder = nil
+            }
             DispatchQueue.main.async { self.isTransmitting = false }
         }
 
@@ -1734,6 +1754,25 @@ class AudioManager: ObservableObject {
 
         setRealtimeDecodePaused(true)
         radeWrapper.txReset()
+
+        #if os(iOS)
+        // Half-duplex: nothing plays while transmitting, so switch the mic to
+        // raw capture for the over. In .default mode iOS applies input AGC —
+        // the gain ramps for the first seconds and keeps pumping with speech,
+        // which garbles the LPCNet features. Restored to .default at unkey
+        // (the speaker loudness profile only matters for RX).
+        if RadioSettings.audioInputSource == .icomRadio {
+            do {
+                try AVAudioSession.sharedInstance().setCategory(
+                    .playAndRecord, mode: .measurement,
+                    options: preferredSessionOptionsForCurrentState())
+                appLog("TX: session mode → .measurement (raw mic, AGC off)")
+            } catch {
+                appLog("TX: session mode switch failed: \(error) — keeping current mode")
+            }
+        }
+        #endif
+
         radio.configureForFreeDVTransmitIfNeeded()
         radio.setPTT(true)
 
@@ -1752,6 +1791,14 @@ class AudioManager: ObservableObject {
         }
         appLog("TX: mic format ch=\(inputFormat.channelCount) sr=\(inputFormat.sampleRate) → 16kHz Int16")
         installTxTap(inputFormat: inputFormat)
+        let recorder = WAVRecorder()
+        if (try? recorder.start(filename: "tx_speech_debug.wav")) != nil {
+            txSpeechRecorder = recorder
+        }
+        let modemRecorder = WAVRecorder(sampleRate: 8000)
+        if (try? modemRecorder.start(filename: "tx_modem_debug.wav")) != nil {
+            txModemRecorder = modemRecorder
+        }
         reporter?.reportTx(transmitting: true)
         DispatchQueue.main.async { self.isTransmitting = true }
     }
@@ -1767,18 +1814,45 @@ class AudioManager: ObservableObject {
         txQueue.async { [weak self] in
             guard let self = self else { return }
             let eoo = self.radeWrapper.txEndOfOver(callsign: callsign)
-            if !eoo.isEmpty { self.sendTxModemSamples(eoo) }
+            if !eoo.isEmpty {
+                eoo.withUnsafeBufferPointer { eb in
+                    if let ep = eb.baseAddress {
+                        self.txModemRecorder?.writeSamples(ep, count: eoo.count)
+                    }
+                }
+                self.sendTxModemSamples(eoo)
+            }
             // Flush padding: the paced audio stream only drains once its
             // 200 ms prebuffer threshold is crossed, so push the EOO through
             // with trailing silence (only zeros can remain stuck).
             self.sendTxModemSamples([Int16](repeating: 0, count: 1600))
+            radio?.noteTxAudioFlushing()
             // Let the tail drain before unkeying: FIFO cushion (~200 ms) +
             // EOO (~144 ms) + padding (200 ms) + radio jitter buffer (400 ms).
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.1) {
                 radio?.setPTT(false)
                 self.reporter?.reportTx(transmitting: false)
+                #if os(iOS)
+                // Restore the RX speaker loudness profile (see startTX).
+                if RadioSettings.audioInputSource == .icomRadio {
+                    try? AVAudioSession.sharedInstance().setCategory(
+                        .playAndRecord, mode: self.preferredSessionModeForCurrentState(),
+                        options: self.preferredSessionOptionsForCurrentState())
+                    appLog("TX: session mode restored → \(self.preferredSessionModeForCurrentState().rawValue)")
+                }
+                #endif
                 self.setRealtimeDecodePaused(false)
                 self.isTransmitting = false
+                if let rec = self.txSpeechRecorder {
+                    _ = rec.stop()
+                    self.txSpeechRecorder = nil
+                    appLog("TX: speech debug WAV → \(WAVRecorder.recordingsDirectory.appendingPathComponent("tx_speech_debug.wav").path)")
+                }
+                if let rec = self.txModemRecorder {
+                    _ = rec.stop()
+                    self.txModemRecorder = nil
+                    appLog("TX: modem debug WAV → \(WAVRecorder.recordingsDirectory.appendingPathComponent("tx_modem_debug.wav").path)")
+                }
             }
         }
     }
@@ -1808,6 +1882,18 @@ class AudioManager: ObservableObject {
     /// Mic buffer → 16 kHz mono Int16 → LPCNet + RADE TX → WiFi modem samples.
     private func processTXInput(buffer: AVAudioPCMBuffer) {
         guard let converter = txConverter, let monoFmt = txMonoFormat else { return }
+        // Route change mid-TX (e.g. Bluetooth headset joins) can change the
+        // mic rate; a stale converter would pitch-shift/garble the speech.
+        if buffer.format.sampleRate != monoFmt.sampleRate {
+            appLog("TX: mic rate changed \(monoFmt.sampleRate) → \(buffer.format.sampleRate) Hz — rebuilding converter")
+            if let newMono = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                           sampleRate: buffer.format.sampleRate,
+                                           channels: 1, interleaved: true) {
+                txMonoFormat = newMono
+                txConverter = AVAudioConverter(from: newMono, to: txSpeechFormat)
+            }
+            return
+        }
         let inputFrames = Int(buffer.frameLength)
         guard inputFrames > 0, let floatData = buffer.floatChannelData else { return }
 
@@ -1837,6 +1923,13 @@ class AudioManager: ObservableObject {
         txQueue.async { [weak self] in
             guard let self = self, self.isTransmitting else { return }
             self.txMicBufferCount += 1
+            var speechPeak: Int16 = 0
+            for s in copy { let a = s == Int16.min ? Int16.max : abs(s); if a > speechPeak { speechPeak = a } }
+            copy.withUnsafeBufferPointer { buf in
+                if let ptr = buf.baseAddress {
+                    self.txSpeechRecorder?.writeSamples(ptr, count: count)
+                }
+            }
             let modem = copy.withUnsafeBufferPointer { buf -> [Int16]? in
                 guard let ptr = buf.baseAddress else { return nil }
                 return self.radeWrapper.txProcessSpeechSamples(ptr, count: Int32(count))
@@ -1845,11 +1938,16 @@ class AudioManager: ObservableObject {
             if let modem = modem, !modem.isEmpty {
                 self.txModemSampleTotal += modem.count
                 for s in modem { let a = s == Int16.min ? Int16.max : abs(s); if a > modemPeak { modemPeak = a } }
+                modem.withUnsafeBufferPointer { mb in
+                    if let mp = mb.baseAddress {
+                        self.txModemRecorder?.writeSamples(mp, count: modem.count)
+                    }
+                }
                 self.sendTxModemSamples(modem)
             }
             // Periodic TX diagnostic (~every 25 mic buffers).
             if self.txMicBufferCount % 25 == 0 {
-                appLog("TX: micBuffers=\(self.txMicBufferCount) modemSamples=\(self.txModemSampleTotal) packets=\(self.txPacketCount) modemPeak=\(modemPeak)/32767")
+                appLog("TX: micBuffers=\(self.txMicBufferCount) modemSamples=\(self.txModemSampleTotal) packets=\(self.txPacketCount) speechPeak=\(speechPeak)/32767 modemPeak=\(modemPeak)/32767")
             }
         }
     }
@@ -2160,12 +2258,17 @@ class AudioManager: ObservableObject {
     
     // MARK: - Audio Output
     
+    /// Makeup gain (+8 dB) for decoded speech — RADE/FARGAN synthesis output
+    /// is conservative and needs help on the iPhone speaker. Peaks are
+    /// clamped; the user volume slider still applies on top at render time.
+    private let speechMakeupGain: Float = 2.5
+
     /// Enqueue decoded speech into the ring buffer for the source node to consume.
     private func playDecodedAudio(samples: UnsafePointer<Int16>, count: Int) {
-        // Convert int16 → float and push into ring buffer
+        // Convert int16 → float (with makeup gain) and push into ring buffer
         var floats = [Float](repeating: 0, count: count)
         for i in 0..<count {
-            floats[i] = Float(samples[i]) / 32768.0
+            floats[i] = max(-1.0, min(1.0, Float(samples[i]) * speechMakeupGain / 32768.0))
         }
         
         // Calculate output level for meter (skip in background)

@@ -5,10 +5,15 @@ import Foundation
 class WAVRecorder {
     private var fileHandle: FileHandle?
     private var totalSamples: UInt32 = 0
-    private let sampleRate: UInt32 = 16000
+    private let sampleRate: UInt32
     private let bitsPerSample: UInt16 = 16
     private let channels: UInt16 = 1
     private(set) var currentFilename: String?
+
+    /// Default 16 kHz (decoded speech); pass 8000 for modem waveforms.
+    init(sampleRate: UInt32 = 16000) {
+        self.sampleRate = sampleRate
+    }
     
     func start(filename: String) throws {
         let url = Self.recordingsDirectory.appendingPathComponent(filename)

@@ -227,6 +227,169 @@ final class IcomSerialStream: IcomUDPStream {
     }
 }
 
+// MARK: - 8 kHz ↔ 48 kHz conversion (ported from the Android implementation)
+
+/// 8 kHz → 48 kHz polyphase interpolator, ported from RADE_decode_Android's
+/// audio_engine.cpp (designNetTxInterpFilter / fillNetTxFrame): windowed-sinc
+/// prototype (4-term Blackman-Harris, cutoff 3.5 kHz), 6 phases × 24 taps,
+/// each phase normalized to unity gain. History is carried across calls so
+/// frames join seamlessly.
+private final class ModemUpsampler {
+    private static let L = 6
+    private static let tpp = 24
+    private static let phases: [[Float]] = {
+        let total = L * tpp
+        let m = Float(total - 1)
+        let fc: Float = 3500.0 / 48000.0
+        var proto = [Float](repeating: 0, count: total)
+        for i in 0..<total {
+            let n = Float(i) - m / 2
+            let h: Float = abs(n) < 1e-6 ? 2 * fc : sin(2 * Float.pi * fc * n) / (Float.pi * n)
+            let w: Float = 0.35875
+                - 0.48829 * cos(2 * Float.pi * Float(i) / m)
+                + 0.14128 * cos(4 * Float.pi * Float(i) / m)
+                - 0.01168 * cos(6 * Float.pi * Float(i) / m)
+            proto[i] = h * w
+        }
+        var ph = [[Float]](repeating: [Float](repeating: 0, count: tpp), count: L)
+        for p in 0..<L {
+            var sum: Float = 0
+            for k in 0..<tpp {
+                let idx = k * L + p
+                ph[p][k] = idx < total ? proto[idx] : 0
+                sum += ph[p][k]
+            }
+            if abs(sum) > 1e-9 {
+                for k in 0..<tpp { ph[p][k] /= sum }
+            }
+        }
+        return ph
+    }()
+    private var hist = [Float](repeating: 0, count: ModemUpsampler.tpp)
+    private var pos = 0
+
+    func process(_ input: [Int16]) -> [Int16] {
+        let L = ModemUpsampler.L, tpp = ModemUpsampler.tpp
+        var out = [Int16]()
+        out.reserveCapacity(input.count * L)
+        for s in input {
+            hist[pos] = Float(s)
+            pos = (pos + 1) % tpp
+            for p in 0..<L {
+                let hp = ModemUpsampler.phases[p]
+                var acc: Float = 0
+                var idx = pos
+                for k in 0..<tpp {
+                    idx -= 1
+                    if idx < 0 { idx = tpp - 1 }
+                    acc += hist[idx] * hp[k]
+                }
+                out.append(Int16(max(-32767, min(32767, acc))))
+            }
+        }
+        return out
+    }
+}
+
+/// 48 kHz → 8 kHz FIR decimator, ported from RADE_decode_Android's
+/// audio_engine.cpp (designDecimFilter / feedNetRx): windowed-sinc lowpass
+/// with cutoff 4 kHz (output Nyquist), 48 taps per phase (288 total),
+/// 4-term Blackman-Harris window, unity DC gain. No attenuation — RADE
+/// takes the radio's line level directly in this pipeline.
+private final class ModemDownsampler {
+    private static let factor = 6
+    private static let totalTaps = 48 * 6
+    private static let taps: [Float] = {
+        let total = totalTaps
+        let m = Float(total - 1)
+        let fc: Float = 8000.0 / (2.0 * 48000.0)
+        var h = [Float](repeating: 0, count: total)
+        var sum: Float = 0
+        for i in 0..<total {
+            let n = Float(i) - m / 2
+            let s: Float = abs(n) < 1e-6 ? 2 * fc : sin(2 * Float.pi * fc * n) / (Float.pi * n)
+            let w: Float = 0.35875
+                - 0.48829 * cos(2 * Float.pi * Float(i) / m)
+                + 0.14128 * cos(4 * Float.pi * Float(i) / m)
+                - 0.01168 * cos(6 * Float.pi * Float(i) / m)
+            h[i] = s * w
+            sum += h[i]
+        }
+        for i in 0..<total { h[i] /= sum }
+        return h
+    }()
+    private var hist = [Float](repeating: 0, count: ModemDownsampler.totalTaps)
+    private var pos = 0
+    private var phase = 0
+
+    func process(_ input: [Int16]) -> [Int16] {
+        let total = ModemDownsampler.totalTaps
+        let taps = ModemDownsampler.taps
+        var out = [Int16]()
+        out.reserveCapacity(input.count / ModemDownsampler.factor + 1)
+        for s in input {
+            hist[pos] = Float(s)
+            pos = (pos + 1) % total
+            phase += 1
+            if phase >= ModemDownsampler.factor {
+                phase = 0
+                var acc: Float = 0
+                var idx = pos
+                for k in 0..<total {
+                    idx -= 1
+                    if idx < 0 { idx = total - 1 }
+                    acc += hist[idx] * taps[k]
+                }
+                out.append(Int16(max(-32767, min(32767, acc))))
+            }
+        }
+        return out
+    }
+}
+
+/// Minimal in-order jitter buffer over the 16-bit outer packet sequence,
+/// ported from the Android implementation: releases contiguous packets
+/// immediately; if the next expected packet is missing and the buffer grows
+/// past `maxDepth`, skips forward to the oldest buffered packet so audio
+/// never stalls. Single-threaded (audio stream queue only).
+private final class AudioJitterBuffer {
+    private var buf: [UInt16: [Int16]] = [:]
+    private var expected = -1
+    private let maxDepth = 24
+    private let onSamples: ([Int16]) -> Void
+
+    init(onSamples: @escaping ([Int16]) -> Void) {
+        self.onSamples = onSamples
+    }
+
+    func add(seq: UInt16, samples: [Int16]) {
+        if expected < 0 { expected = Int(seq) }
+        if seqLess(seq, UInt16(truncatingIfNeeded: expected)) { return }
+        buf[seq] = samples
+        drain()
+        if buf.count > maxDepth {
+            var oldest: UInt16?
+            for k in buf.keys where oldest == nil || seqLess(k, oldest!) { oldest = k }
+            if let o = oldest {
+                expected = Int(o)
+                drain()
+            }
+        }
+    }
+
+    private func drain() {
+        while let s = buf.removeValue(forKey: UInt16(truncatingIfNeeded: expected)) {
+            onSamples(s)
+            expected = (expected + 1) & 0xFFFF
+        }
+    }
+
+    private func seqLess(_ a: UInt16, _ b: UInt16) -> Bool {
+        let d = (Int(b) - Int(a)) & 0xFFFF
+        return d != 0 && d < 0x8000
+    }
+}
+
 // MARK: - Audio stream
 
 final class IcomAudioStream: IcomUDPStream {
@@ -269,24 +432,32 @@ final class IcomAudioStream: IcomUDPStream {
 
     // MARK: TX pacing
     //
-    // The radio expects a steady 20 ms audio stream (RS-BA1/wfview send one
-    // packet per audio-device callback). RADE produces modem samples in
-    // ~120 ms bursts; sent as-is, one late burst underruns the radio's
-    // jitter buffer and the SSB carrier drops out for a moment.
-    // So: samples are queued in a FIFO and drained 160 samples (20 ms) per
-    // timer tick, sending silence when the FIFO runs dry. Real audio only
-    // starts draining once the FIFO holds `txPrebufferSamples` — that
-    // pre-buffer is the steady-state cushion (production and consumption
-    // rates are equal, so whatever depth draining starts with is kept),
-    // absorbing late encoder bursts. All state is queue-confined.
+    // The radio expects a steady 20 ms audio-frame stream. RADE produces
+    // modem samples in ~120 ms bursts; sent as-is, one late burst underruns
+    // the radio's jitter buffer and the SSB carrier drops out for a moment.
+    // So: samples are upsampled to 48 kHz, queued in a FIFO, and drained one
+    // 960-sample frame (20 ms) per timer tick — fragmented into the two
+    // packet sizes the radio expects (1364 B + 556 B payloads, exactly like
+    // the Android implementation) — sending silence when the FIFO runs dry.
+    // Real audio only starts draining once the FIFO holds
+    // `txPrebufferSamples`: that pre-buffer is the steady-state cushion
+    // (production and consumption rates are equal, so whatever depth
+    // draining starts with is kept), absorbing late encoder bursts.
+    // All state is queue-confined.
     private var txFifo: [Int16] = []
     private var txPaceTimer: DispatchSourceTimer?
     private var txDraining = false
-    private let txChunkSamples = 160                  // 20 ms @ 8 kHz
-    private let txPrebufferSamples = 1600             // 200 ms cushion
-    private let txFifoCap = 16000                     // 2 s safety cap
+    private let txChunkSamples = 960                  // 20 ms @ 48 kHz
+    private let txFragmentSamples = 682               // 1364 B first fragment
+    private let txPrebufferSamples = 9600             // 200 ms cushion
+    private let txFifoCap = 96000                     // 2 s safety cap
     private var txRealPacketCount = 0
     private var txUnderrunCount = 0
+    private let txUpsampler = ModemUpsampler()
+    private let rxDownsampler = ModemDownsampler()
+    private lazy var rxJitter = AudioJitterBuffer { [weak self] samples in
+        self?.handleOrderedRxAudio(samples)
+    }
     /// Mirrors PTT (set via setTxActive) so drain events can be classified:
     /// PTT down = mid-over underrun (bad), PTT up = end-of-over flush (normal).
     private var txActive = false
@@ -295,20 +466,24 @@ final class IcomAudioStream: IcomUDPStream {
     func setTxActive(_ active: Bool) {
         txActive = active
         guard active, txPaceTimer != nil else { return }
-        // Prime the pipeline: pre-fill the prebuffer with leading silence so
-        // draining starts on the next tick instead of holding the first modem
-        // burst back until the threshold fills — cuts ~200 ms off PTT-to-RF
-        // while keeping the same cushion depth (as zeros at first).
-        if !txDraining, txFifo.count < txPrebufferSamples {
-            let padding = txPrebufferSamples - txFifo.count
+        // Prime the pipeline: pre-fill with leading silence so draining
+        // starts on the next tick instead of holding the first modem burst
+        // back until the threshold fills. Primed to 2× the prebuffer: the
+        // encoder needs ~350 ms to spin up (first mic buffer + feature
+        // accumulation), longer than the 200 ms threshold, and priming only
+        // to the threshold guaranteed one underrun at the start of each over.
+        let primeTarget = txPrebufferSamples * 2
+        if !txDraining, txFifo.count < primeTarget {
+            let padding = primeTarget - txFifo.count
             txFifo.insert(contentsOf: [Int16](repeating: 0, count: padding), at: 0)
         }
     }
 
-    /// Queue TX modem samples; the pacing timer sends them at 20 ms cadence.
+    /// Queue TX modem samples (8 kHz — upsampled to 48 kHz here); the pacing
+    /// timer sends them as 20 ms frames.
     func sendAudio(_ samples: [Int16]) {
         guard !samples.isEmpty else { return }
-        txFifo.append(contentsOf: samples)
+        txFifo.append(contentsOf: txUpsampler.process(samples))
         if txFifo.count > txFifoCap {
             txFifo.removeFirst(txFifo.count - txFifoCap)
         }
@@ -321,22 +496,30 @@ final class IcomAudioStream: IcomUDPStream {
         t.setEventHandler { [weak self] in self?.sendPacedTxPacket() }
         t.resume()
         txPaceTimer = t
-        appLog("Icom[audio]: TX pacing started (20 ms/packet, \(txPrebufferSamples / 8) ms prebuffer)")
+        appLog("Icom[audio]: TX pacing started (20 ms frames @48 kHz, \(txPrebufferSamples / 48) ms prebuffer)")
     }
 
     private func sendPacedTxPacket() {
+        // Frames flow only while transmitting or draining the EOO tail — the
+        // radio gets NO audio packets between overs, exactly like the Android
+        // pump (`while isTxRunning || ring > 0`). Sub-frame leftovers after a
+        // flush are trailing padding zeros; discard them.
+        if !txActive && !txDraining {
+            if !txFifo.isEmpty { txFifo.removeAll(keepingCapacity: true) }
+            return
+        }
         if !txDraining, txFifo.count >= txPrebufferSamples {
             txDraining = true
         }
-        let chunk: [Int16]
+        let frame: [Int16]
         if txDraining, txFifo.count >= txChunkSamples {
-            chunk = Array(txFifo.prefix(txChunkSamples))
+            frame = Array(txFifo.prefix(txChunkSamples))
             txFifo.removeFirst(txChunkSamples)
             txRealPacketCount += 1
             if txRealPacketCount == 1 {
-                appLog("Icom[audio]: first TX audio packet (remoteId=\(builder.remoteId != nil ? "set" : "NIL"))")
+                appLog("Icom[audio]: first TX audio frame (remoteId=\(builder.remoteId != nil ? "set" : "NIL"))")
             } else if txRealPacketCount % 250 == 0 {
-                appLog("Icom[audio]: TX audio #\(txRealPacketCount) fifo=\(txFifo.count) underruns=\(txUnderrunCount)")
+                appLog("Icom[audio]: TX audio frame #\(txRealPacketCount) fifo=\(txFifo.count) underruns=\(txUnderrunCount)")
             }
         } else {
             if txDraining {
@@ -344,24 +527,43 @@ final class IcomAudioStream: IcomUDPStream {
                 txDraining = false
                 txUnderrunCount += 1
                 if txActive {
-                    appLog("Icom[audio]: TX FIFO drained #\(txUnderrunCount) after \(txRealPacketCount) packets — MID-OVER UNDERRUN (encoder starved)")
+                    appLog("Icom[audio]: TX FIFO drained #\(txUnderrunCount) after \(txRealPacketCount) frames — MID-OVER UNDERRUN (encoder starved)")
                 } else {
-                    appLog("Icom[audio]: TX FIFO drained #\(txUnderrunCount) after \(txRealPacketCount) packets (end-of-over flush, normal)")
+                    appLog("Icom[audio]: TX FIFO drained #\(txUnderrunCount) after \(txRealPacketCount) frames (end-of-over flush, normal)")
                 }
             }
-            // Full silence packet; queued samples stay intact so the modem
+            // Full silence frame; queued samples stay intact so the modem
             // waveform remains sample-continuous when draining resumes.
-            chunk = [Int16](repeating: 0, count: txChunkSamples)
+            frame = [Int16](repeating: 0, count: txChunkSamples)
         }
-        let packet = builder.audioPacket(samples: chunk)
-        // Track for retransmit (wfview sends TX audio via its tracked path).
-        track(data: packet)
-        send(data: packet)
+        // One 20 ms frame = 1920 B, fragmented into the two packet sizes the
+        // radio expects (1364 B + 556 B payloads — exactly like the Android
+        // implementation); each fragment is tracked with its own sequence
+        // (wfview sends TX audio via its tracked path too).
+        let part1 = Array(frame[0..<txFragmentSamples])
+        let part2 = Array(frame[txFragmentSamples...])
+        for part in [part1, part2] {
+            let packet = builder.audioPacket(samples: part)
+            track(data: packet)
+            send(data: packet)
+        }
     }
 
     override func invalidateTimers() {
         txPaceTimer?.cancel(); txPaceTimer = nil
         super.invalidateTimers()
+    }
+
+    /// The audio stream must NOT send periodic idle packets: they consume the
+    /// same outer sequence space as the audio data packets, so the radio sees
+    /// a sequence gap in its audio stream once a second and treats it as
+    /// packet loss (the Android implementation documents the same rule —
+    /// "the audio stream sends NO periodic idle pkt0"). Keepalive comes from
+    /// pings; the idle timer only completes disconnects.
+    override func onIdleTimer() {
+        if disconnecting {
+            super.onIdleTimer()
+        }
     }
 
     override func receive(data: Data) {
@@ -391,7 +593,8 @@ final class IcomAudioStream: IcomUDPStream {
     }
 
     /// Log RX audio flow: first packet, then packet/sample rate every ~5 s.
-    /// ~8000 samples/s confirms the negotiated 8 kHz LPCM stream is arriving.
+    /// ~48000 samples/s confirms the negotiated 48 kHz LPCM stream is arriving
+    /// (~8000 would mean the radio ignored the rate and stayed at 8 kHz).
     private func noteRxAudio(_ payloadBytes: Int) {
         if !rxAudioStarted {
             rxAudioStarted = true
@@ -412,9 +615,12 @@ final class IcomAudioStream: IcomUDPStream {
         }
     }
 
-    /// Convert little-endian 16-bit PCM bytes to [Int16]. (We always negotiate
-    /// 16-bit LPCM, so this is the only format we expect.)
+    /// Convert little-endian 16-bit PCM bytes to [Int16] and reorder by the
+    /// packet's outer sequence — at 48 kHz the radio fragments the stream
+    /// into 1364 B + 556 B packets, so out-of-order delivery would garble
+    /// the reconstructed stream. (We always negotiate 16-bit LPCM.)
     private func deliverAudio(_ payload: Data.SubSequence) {
+        typealias c = ControlField
         let bytes = Array(payload)
         guard bytes.count >= 2 else { return }
         var samples = [Int16](repeating: 0, count: bytes.count / 2)
@@ -423,7 +629,16 @@ final class IcomAudioStream: IcomUDPStream {
             let hi = UInt16(bytes[i * 2 + 1])
             samples[i] = Int16(bitPattern: lo | (hi << 8))
         }
-        onRxAudio?(samples)
+        rxJitter.add(seq: current[c.sequence].u16, samples: samples)
+    }
+
+    /// In-order 48 kHz PCM from the jitter buffer → decimate to the 8 kHz
+    /// modem rate → decoder.
+    private func handleOrderedRxAudio(_ samples: [Int16]) {
+        let modemSamples = rxDownsampler.process(samples)
+        if !modemSamples.isEmpty {
+            onRxAudio?(modemSamples)
+        }
     }
 }
 
