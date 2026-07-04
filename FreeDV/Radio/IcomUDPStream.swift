@@ -40,9 +40,34 @@ class IcomUDPStream {
     var disconnecting = false
     private(set) var current = Data()
 
-    private let pingInterval = 3.0
+    // Ping every 500 ms (wfview's PING_PERIOD): during transmit the HF field
+    // stresses the 2.4 GHz link, and at 3 s cadence a couple of lost pings
+    // meant 6-9 s of silence — enough for the radio's watchdog to drop the
+    // session right around the end of an over.
+    private let pingInterval = 0.5
     private let idleInterval = 1.0
     private let retryInterval = 5.0
+
+    // MARK: Link watchdog
+    //
+    // The radio (or its ping replies) is heard every few hundred ms on a
+    // healthy stream. If nothing arrives for `linkTimeout` seconds the link
+    // is declared dead via onConnected(false) — without this the app never
+    // notices the radio dropped the session.
+    private var lastReceiveDate = Date()
+    private var linkWatchdogTimer: DispatchSourceTimer?
+    private var linkDeclaredDead = false
+    /// Seconds of receive silence tolerated before declaring the link dead.
+    var linkTimeout: TimeInterval = 0
+    /// Date the watchdog measures silence against. Default: any received
+    /// packet. The audio stream overrides this to track PCM specifically —
+    /// its port stays chatty with pings even when the radio has silently
+    /// stopped streaming audio.
+    var linkWatchdogReferenceDate: Date { lastReceiveDate }
+    /// Subclasses can suppress the watchdog during phases where silence is
+    /// expected (the audio stream while we transmit — the radio may pause
+    /// its RX PCM stream then).
+    var linkWatchdogSuppressed: Bool { false }
 
     // Retransmit tracking (bounded). 64 packets ≈ 1.3 s of paced TX audio —
     // deep enough to answer retransmit requests after a WiFi loss burst.
@@ -101,6 +126,16 @@ class IcomUDPStream {
             appLog("Icom[\(label)]: NWConnection ready (local=\(local))")
             startConnection()
             startReceive()
+            // Pre-handshake dead-stream detection: if the handshake (or the
+            // PCM flow, for the audio stream) doesn't materialize within
+            // linkTimeout, declare the stream dead — a local-port bind
+            // collision (EADDRINUSE right after a reconnect) otherwise
+            // leaves a silently stuck stream nobody watches.
+            armLinkWatchdog()
+        case .waiting(let error):
+            // Typically EADDRINUSE while the previous socket is still
+            // releasing — visible here, resolved by the watchdog + reconnect.
+            appLog("Icom[\(label)]: connection waiting: \(error)")
         case .failed(let error):
             appLog("Icom[\(label)]: connection failed: \(error)")
             onConnected?(false)
@@ -133,9 +168,30 @@ class IcomUDPStream {
     }
 
     private func dispatchReceive(_ data: Data) {
+        lastReceiveDate = Date()
+        linkDeclaredDead = false
         current = data
         if checkRetransmitRequest() { return }
         receive(data: data)
+    }
+
+    /// Start (or restart) the receive-silence watchdog. Call once the stream
+    /// is fully established and `linkTimeout` is set.
+    func armLinkWatchdog() {
+        guard linkTimeout > 0 else { return }
+        linkWatchdogTimer?.cancel()
+        lastReceiveDate = Date()
+        linkDeclaredDead = false
+        linkWatchdogTimer = makeTimer(interval: 1.0, repeats: true) { [weak self] in
+            guard let self, !self.disconnecting, !self.linkDeclaredDead,
+                  !self.linkWatchdogSuppressed else { return }
+            let silence = Date().timeIntervalSince(self.linkWatchdogReferenceDate)
+            if silence > self.linkTimeout {
+                self.linkDeclaredDead = true
+                appLog("Icom[\(self.label)]: link dead — nothing received for \(Int(silence)) s")
+                self.onConnected?(false)
+            }
+        }
     }
 
     /// Called once the socket is ready. Default: kick off the handshake.
@@ -307,6 +363,7 @@ class IcomUDPStream {
         pingTimer?.cancel(); pingTimer = nil
         idleTimer?.cancel(); idleTimer = nil
         resendTimer?.cancel(); resendTimer = nil
+        linkWatchdogTimer?.cancel(); linkWatchdogTimer = nil
     }
 
     func cancel() {

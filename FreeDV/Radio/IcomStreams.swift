@@ -144,6 +144,11 @@ final class IcomControlStream: IcomUDPStream {
         armPingTimer()
         armIdleTimer()
         invalidateResendTimer()
+        // Session-death detector: the radio (or its ping replies) is heard
+        // sub-second on a healthy control link; 5 s of silence means the
+        // session is gone and triggers the controller's auto-reconnect.
+        linkTimeout = 5
+        armLinkWatchdog()
         onRadioInfo?(radioName, civAddr)
         onState?("Connected")
         onConnected?(true)
@@ -425,6 +430,16 @@ final class IcomAudioStream: IcomUDPStream {
     private var rxWindowPackets = 0
     private var rxWindowBytes = 0
     private var rxWindowStart: Date?
+    /// Last time a PCM packet arrived — the link watchdog measures against
+    /// this, not against pings, so "radio silently stopped streaming audio
+    /// while still answering pings" is detected and triggers a reconnect.
+    private var lastPcmDate = Date()
+
+    override var linkWatchdogReferenceDate: Date { lastPcmDate }
+
+    /// Never judge PCM silence while we transmit — the radio may legitimately
+    /// pause its RX stream during our TX.
+    override var linkWatchdogSuppressed: Bool { txActive }
 
     /// TX audio gets the WMM voice queue and exemption from WiFi power-save
     /// batching — paced packets must not stall during WiFi housekeeping.
@@ -465,6 +480,9 @@ final class IcomAudioStream: IcomUDPStream {
     /// Called (on the stream queue) when PTT changes.
     func setTxActive(_ active: Bool) {
         txActive = active
+        // Restart the PCM-silence window at both PTT edges so the watchdog
+        // never counts time spent transmitting (see linkWatchdogSuppressed).
+        lastPcmDate = Date()
         guard active, txPaceTimer != nil else { return }
         // Prime the pipeline: pre-fill with leading silence so draining
         // starts on the next tick instead of holding the first modem burst
@@ -581,8 +599,14 @@ final class IcomAudioStream: IcomUDPStream {
                 onState?("Audio connected")
                 send(data: builder.areYouReadyPacket())
                 invalidateTimers()
-                armIdleTimer()
                 armPingTimer()
+                // Watches the PCM flow (see linkWatchdogReferenceDate): if the
+                // radio stops streaming RX audio for 15 s — even while still
+                // answering pings — the controller does a full reconnect,
+                // which re-sends conninfo and restores the audio session.
+                lastPcmDate = Date()
+                linkTimeout = 15
+                armLinkWatchdog()
                 startTxPacing()
             }, onIAmReady: { })
         case PingField.dataLength:
@@ -596,6 +620,7 @@ final class IcomAudioStream: IcomUDPStream {
     /// ~48000 samples/s confirms the negotiated 48 kHz LPCM stream is arriving
     /// (~8000 would mean the radio ignored the rate and stayed at 8 kHz).
     private func noteRxAudio(_ payloadBytes: Int) {
+        lastPcmDate = Date()
         if !rxAudioStarted {
             rxAudioStarted = true
             appLog("Icom[audio]: RX audio streaming started (\(payloadBytes)-byte payload)")

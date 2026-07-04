@@ -839,6 +839,12 @@ class AudioManager: ObservableObject {
         // Don't disturb the pipeline while transmitting — TX owns the input tap
         // and restarting the engine would kill the outgoing audio.
         guard !isTransmitting else { return }
+        // Network RX: samples come from the radio, not the local engine — a
+        // local rebuild can't help. The radio controller's PCM watchdog and
+        // auto-reconnect own recovery of the network path.
+        if RadioSettings.audioInputSource == .icomRadio {
+            return
+        }
         let now = Date()
         processingBackpressureLock.lock()
         if let last = lastRxRecoveryDate, now.timeIntervalSince(last) < rxRecoveryCooldown {
@@ -946,11 +952,12 @@ class AudioManager: ObservableObject {
     #if os(iOS)
     /// Foreground modem decode prefers raw capture (`.measurement`).
     /// Background execution uses `.default` for better iOS reliability.
-    /// IC-705 network mode never captures the modem waveform from the mic, so
-    /// it always uses `.default` — `.measurement` disables the speaker
-    /// loudness profile and makes decoded speech noticeably quiet.
+    /// IC-705 network mode also uses `.measurement`: the TX mic must be raw
+    /// (input AGC pumps the encoder speech), and switching modes mid-engine
+    /// at PTT proved unreliable (the mic sometimes goes silent after the
+    /// route change). The quieter `.measurement` speaker profile is
+    /// compensated by the decoded-speech makeup gain.
     private func preferredSessionModeForCurrentState() -> AVAudioSession.Mode {
-        if RadioSettings.audioInputSource == .icomRadio { return .default }
         return backgroundMode ? .default : .measurement
     }
     
@@ -1755,24 +1762,9 @@ class AudioManager: ObservableObject {
         setRealtimeDecodePaused(true)
         radeWrapper.txReset()
 
-        #if os(iOS)
-        // Half-duplex: nothing plays while transmitting, so switch the mic to
-        // raw capture for the over. In .default mode iOS applies input AGC —
-        // the gain ramps for the first seconds and keeps pumping with speech,
-        // which garbles the LPCNet features. Restored to .default at unkey
-        // (the speaker loudness profile only matters for RX).
-        if RadioSettings.audioInputSource == .icomRadio {
-            do {
-                try AVAudioSession.sharedInstance().setCategory(
-                    .playAndRecord, mode: .measurement,
-                    options: preferredSessionOptionsForCurrentState())
-                appLog("TX: session mode → .measurement (raw mic, AGC off)")
-            } catch {
-                appLog("TX: session mode switch failed: \(error) — keeping current mode")
-            }
-        }
-        #endif
-
+        // (The session already runs in .measurement — raw mic, no input AGC.
+        // Switching modes here mid-engine proved to silence the mic on some
+        // devices, so the mode is now fixed for the whole session.)
         radio.configureForFreeDVTransmitIfNeeded()
         radio.setPTT(true)
 
@@ -1832,15 +1824,6 @@ class AudioManager: ObservableObject {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.1) {
                 radio?.setPTT(false)
                 self.reporter?.reportTx(transmitting: false)
-                #if os(iOS)
-                // Restore the RX speaker loudness profile (see startTX).
-                if RadioSettings.audioInputSource == .icomRadio {
-                    try? AVAudioSession.sharedInstance().setCategory(
-                        .playAndRecord, mode: self.preferredSessionModeForCurrentState(),
-                        options: self.preferredSessionOptionsForCurrentState())
-                    appLog("TX: session mode restored → \(self.preferredSessionModeForCurrentState().rawValue)")
-                }
-                #endif
                 self.setRealtimeDecodePaused(false)
                 self.isTransmitting = false
                 if let rec = self.txSpeechRecorder {

@@ -57,8 +57,21 @@ final class IcomRadioController: ObservableObject {
 
     // MARK: - Connect / disconnect
 
+    // Auto-reconnect state (main-thread confined).
+    private var userInitiatedDisconnect = false
+    private var reconnectAttempts = 0
+    private let maxReconnectAttempts = 5
+
+    /// Main thread only (called from the UI).
     func connect() {
         guard connectionState == .disconnected || isFailed else { return }
+        userInitiatedDisconnect = false
+        reconnectAttempts = 0
+        openConnection()
+    }
+
+    /// Build and start the control stream (also used by auto-reconnect).
+    private func openConnection() {
         host = RadioSettings.host
         let username = RadioSettings.username
         let password = RadioSettings.password
@@ -76,6 +89,10 @@ final class IcomRadioController: ObservableObject {
                                         audioPort: RadioSettings.audioPort,
                                         enableTx: RadioSettings.enableTx,
                                         builder: makeBuilder(username, password, computer))
+        // Watchdog runs from socket-ready: a connect that can't complete its
+        // handshake within 5 s (radio off, port bind collision) is declared
+        // dead instead of waiting forever.
+        control.linkTimeout = 5
         control.onState = { [weak self] text in self?.onMain { self?.statusText = text } }
         control.onConnected = { [weak self] up in self?.handleControlConnected(up) }
         control.onRadioInfo = { [weak self] name, civAddr in
@@ -88,23 +105,45 @@ final class IcomRadioController: ObservableObject {
         control.start()
     }
 
+    /// Main thread only (called from the UI).
     func disconnect() {
         appLog("Icom: disconnecting")
+        userInitiatedDisconnect = true
+        teardownStreams(sendGoodbye: true)
+        onMain {
+            self.connectionState = .disconnected
+            self.statusText = "Disconnected"
+            self.isTransmitting = false
+        }
+    }
+
+    /// Detach and shut down all streams. Goodbye packets are only worth
+    /// sending on a live link (user-initiated disconnect); on a dead one the
+    /// streams are just cancelled. Stale callbacks are cleared so a dying
+    /// stream's events can't re-trigger reconnect logic.
+    private func teardownStreams(sendGoodbye: Bool) {
         streamsLock.lock()
         let control = controlStream, serial = serialStream, audio = audioStream
         controlStream = nil; serialStream = nil; audioStream = nil
         streamsLock.unlock()
 
-        control?.disconnect()
-        serial?.disconnect()
-        audio?.disconnect()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-            control?.cancel(); serial?.cancel(); audio?.cancel()
+        for stream in [control as IcomUDPStream?, serial, audio] {
+            stream?.onConnected = nil
+            stream?.onState = nil
         }
-        onMain {
-            self.connectionState = .disconnected
-            self.statusText = "Disconnected"
-            self.isTransmitting = false
+        if sendGoodbye {
+            control?.disconnect()
+            serial?.disconnect()
+            audio?.disconnect()
+            // Short grace for the goodbye datagrams to flush, then release
+            // the sockets quickly — the fixed local ports (50001-3) must be
+            // free before any reconnect, or the new streams hit EADDRINUSE
+            // and hang in .waiting.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                control?.cancel(); serial?.cancel(); audio?.cancel()
+            }
+        } else {
+            control?.cancel(); serial?.cancel(); audio?.cancel()
         }
     }
 
@@ -122,8 +161,51 @@ final class IcomRadioController: ObservableObject {
         onMain {
             if up {
                 self.connectionState = .connected
-            } else if self.connectionState != .disconnected {
+                self.reconnectAttempts = 0
+                return
+            }
+            guard !self.userInitiatedDisconnect,
+                  self.connectionState != .disconnected else { return }
+            if self.connectionState == .connected {
+                // Established session died (radio watchdog dropped us after a
+                // WiFi stall, radio powered off, …) — reconnect automatically.
+                self.scheduleReconnect()
+            } else if self.reconnectAttempts == 0 {
+                // Initial user-initiated connect failed — no auto-retry.
                 self.connectionState = .failed(self.statusText)
+            }
+            // else: noise during a reconnect attempt (stale stream events);
+            // the attempt-timeout below drives the next retry.
+        }
+    }
+
+    /// Tear down and schedule the next reconnect attempt. Main thread only.
+    private func scheduleReconnect() {
+        teardownStreams(sendGoodbye: false)
+        guard reconnectAttempts < maxReconnectAttempts else {
+            appLog("Icom: giving up after \(maxReconnectAttempts) reconnect attempts")
+            connectionState = .failed("Connection lost")
+            statusText = "Connection lost"
+            return
+        }
+        reconnectAttempts += 1
+        let attempt = reconnectAttempts
+        let delay = min(Double(attempt) * 2.0, 8.0)
+        connectionState = .connecting
+        statusText = "Connection lost — reconnecting (\(attempt)/\(maxReconnectAttempts))…"
+        appLog("Icom: link lost — reconnect attempt \(attempt)/\(maxReconnectAttempts) in \(Int(delay)) s")
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, !self.userInitiatedDisconnect,
+                  self.reconnectAttempts == attempt,
+                  self.connectionState == .connecting else { return }
+            self.openConnection()
+            // If this attempt hasn't established within 8 s, move on.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) { [weak self] in
+                guard let self, !self.userInitiatedDisconnect,
+                      self.reconnectAttempts == attempt,
+                      self.connectionState == .connecting else { return }
+                appLog("Icom: reconnect attempt \(attempt) timed out")
+                self.scheduleReconnect()
             }
         }
     }
@@ -172,13 +254,33 @@ final class IcomRadioController: ObservableObject {
         let audio = IcomAudioStream(host: host, port: RadioSettings.audioPort,
                                     enableTx: RadioSettings.enableTx,
                                     builder: makeBuilder(username, password, computer))
+        // From socket-ready: no PCM within 15 s (handshake stuck on a port
+        // bind collision, or the radio not streaming) → dead → reconnect.
+        audio.linkTimeout = 15
         audio.onRxAudio = { [weak self] samples in self?.onRxAudio?(samples) }
         audio.onState = { text in appLog("Icom[audio]: \(text)") }
-        audio.onConnected = { up in appLog("Icom[audio]: connected=\(up)") }
+        audio.onConnected = { [weak self] up in
+            appLog("Icom[audio]: connected=\(up)")
+            // The radio can silently stop streaming PCM while its control
+            // session stays alive — treat audio death as session death so
+            // the reconnect rebuilds the conninfo/audio state.
+            if !up { self?.handleControlConnected(false) }
+        }
 
         streamsLock.lock(); serialStream = serial; audioStream = audio; streamsLock.unlock()
         serial.start()
         audio.start()
+
+        // If this is an auto-reconnect while the user is still holding PTT,
+        // the fresh audio stream must resume transmitting (and re-key, since
+        // the radio dropped PTT with the old session).
+        onMain {
+            if self.isTransmitting {
+                appLog("Icom: reconnected while PTT held — re-keying")
+                self.withSerial { $0.sendCiv(self.civ.setPTTFrame(true)) }
+                audio.queue.async { audio.setTxActive(true) }
+            }
+        }
 
         // Poll current frequency and mode once the serial link settles.
         serial.queue.asyncAfter(deadline: .now() + 0.8) { [weak self] in
@@ -191,8 +293,21 @@ final class IcomRadioController: ObservableObject {
         // operating mode (LSB-D/USB-D per band + DATA MOD=WLAN) so RX decode
         // works immediately — without this the radio may sit on the wrong
         // sideband and RADE never syncs.
+        scheduleInitialFreeDVConfig()
+    }
+
+    /// Run the connect-time FreeDV mode configuration — but only once the
+    /// frequency readback has arrived, so the sideband choice is real
+    /// (a blind config at freq=0 once forced USB-D on a 40 m dial).
+    private func scheduleInitialFreeDVConfig(attempt: Int = 1) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
             guard let self, self.isConnected else { return }
+            if self.frequencyHz == 0, attempt < 4 {
+                appLog("Icom: frequency not read yet — delaying FreeDV config (try \(attempt))")
+                self.withSerial { $0.sendCiv(self.civ.readFrequencyFrame()) }
+                self.scheduleInitialFreeDVConfig(attempt: attempt + 1)
+                return
+            }
             self.configureForFreeDVTransmit()
         }
     }
