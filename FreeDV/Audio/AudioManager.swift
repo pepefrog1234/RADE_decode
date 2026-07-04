@@ -130,14 +130,14 @@ class AudioManager: ObservableObject {
     private var txMonoFormat: AVAudioFormat?
     private var txConverter: AVAudioConverter?
     private var txTapInstalled = false
-    /// Debug aid: records the exact 16 kHz speech fed to the RADE encoder
-    /// (one fixed file, overwritten each over) so "wrong voice at the far
-    /// end" can be split into mic-capture vs modem problems by playback.
-    private var txSpeechRecorder: WAVRecorder?
-    /// Debug aid: records the 8 kHz modem waveform handed to the radio
-    /// (pre-pacing). Decoding this file with any RADE decoder is a zero-RF
-    /// loopback test of the whole TX chain.
-    private var txModemRecorder: WAVRecorder?
+    /// One-time cleanup of the TX debug recordings left over from the
+    /// TX-chain diagnosis phase (the recorders themselves are gone).
+    private static let removeTxDebugRecordingsOnce: Void = {
+        for name in ["tx_speech_debug.wav", "tx_modem_debug.wav"] {
+            try? FileManager.default.removeItem(
+                at: WAVRecorder.recordingsDirectory.appendingPathComponent(name))
+        }
+    }()
     private let txQueue = DispatchQueue(label: "com.freedv.rade.tx", qos: .userInitiated)
     // TX diagnostics
     private var txMicBufferCount = 0
@@ -1645,14 +1645,6 @@ class AudioManager: ObservableObject {
             removeTxTap()
             radioController?.setPTT(false)
             reporter?.reportTx(transmitting: false)
-            if let rec = txSpeechRecorder {
-                _ = rec.stop()
-                txSpeechRecorder = nil
-            }
-            if let rec = txModemRecorder {
-                _ = rec.stop()
-                txModemRecorder = nil
-            }
             DispatchQueue.main.async { self.isTransmitting = false }
         }
 
@@ -1783,21 +1775,19 @@ class AudioManager: ObservableObject {
         }
         appLog("TX: mic format ch=\(inputFormat.channelCount) sr=\(inputFormat.sampleRate) → 16kHz Int16")
         installTxTap(inputFormat: inputFormat)
-        let recorder = WAVRecorder()
-        if (try? recorder.start(filename: "tx_speech_debug.wav")) != nil {
-            txSpeechRecorder = recorder
-        }
-        let modemRecorder = WAVRecorder(sampleRate: 8000)
-        if (try? modemRecorder.start(filename: "tx_modem_debug.wav")) != nil {
-            txModemRecorder = modemRecorder
-        }
+        _ = Self.removeTxDebugRecordingsOnce
         reporter?.reportTx(transmitting: true)
         DispatchQueue.main.async { self.isTransmitting = true }
     }
 
+    /// True while a stopTX sequence (EOO flush + delayed unkey) is running —
+    /// blocks a second stopTX from double-sending EOO and PTT-off.
+    private var txStopping = false
+
     /// Stop transmitting: flush the End-Of-Over frame, unkey PTT, resume RX.
     func stopTX() {
-        guard isTransmitting else { return }
+        guard isTransmitting, !txStopping else { return }
+        txStopping = true
         appLog("TX: stopping FreeDV transmit")
         removeTxTap()
 
@@ -1806,14 +1796,7 @@ class AudioManager: ObservableObject {
         txQueue.async { [weak self] in
             guard let self = self else { return }
             let eoo = self.radeWrapper.txEndOfOver(callsign: callsign)
-            if !eoo.isEmpty {
-                eoo.withUnsafeBufferPointer { eb in
-                    if let ep = eb.baseAddress {
-                        self.txModemRecorder?.writeSamples(ep, count: eoo.count)
-                    }
-                }
-                self.sendTxModemSamples(eoo)
-            }
+            if !eoo.isEmpty { self.sendTxModemSamples(eoo) }
             // Flush padding: the paced audio stream only drains once its
             // 200 ms prebuffer threshold is crossed, so push the EOO through
             // with trailing silence (only zeros can remain stuck).
@@ -1826,16 +1809,7 @@ class AudioManager: ObservableObject {
                 self.reporter?.reportTx(transmitting: false)
                 self.setRealtimeDecodePaused(false)
                 self.isTransmitting = false
-                if let rec = self.txSpeechRecorder {
-                    _ = rec.stop()
-                    self.txSpeechRecorder = nil
-                    appLog("TX: speech debug WAV → \(WAVRecorder.recordingsDirectory.appendingPathComponent("tx_speech_debug.wav").path)")
-                }
-                if let rec = self.txModemRecorder {
-                    _ = rec.stop()
-                    self.txModemRecorder = nil
-                    appLog("TX: modem debug WAV → \(WAVRecorder.recordingsDirectory.appendingPathComponent("tx_modem_debug.wav").path)")
-                }
+                self.txStopping = false
             }
         }
     }
@@ -1908,11 +1882,6 @@ class AudioManager: ObservableObject {
             self.txMicBufferCount += 1
             var speechPeak: Int16 = 0
             for s in copy { let a = s == Int16.min ? Int16.max : abs(s); if a > speechPeak { speechPeak = a } }
-            copy.withUnsafeBufferPointer { buf in
-                if let ptr = buf.baseAddress {
-                    self.txSpeechRecorder?.writeSamples(ptr, count: count)
-                }
-            }
             let modem = copy.withUnsafeBufferPointer { buf -> [Int16]? in
                 guard let ptr = buf.baseAddress else { return nil }
                 return self.radeWrapper.txProcessSpeechSamples(ptr, count: Int32(count))
@@ -1921,11 +1890,6 @@ class AudioManager: ObservableObject {
             if let modem = modem, !modem.isEmpty {
                 self.txModemSampleTotal += modem.count
                 for s in modem { let a = s == Int16.min ? Int16.max : abs(s); if a > modemPeak { modemPeak = a } }
-                modem.withUnsafeBufferPointer { mb in
-                    if let mp = mb.baseAddress {
-                        self.txModemRecorder?.writeSamples(mp, count: modem.count)
-                    }
-                }
                 self.sendTxModemSamples(modem)
             }
             // Periodic TX diagnostic (~every 25 mic buffers).

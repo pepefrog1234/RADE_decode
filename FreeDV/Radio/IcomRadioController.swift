@@ -90,8 +90,10 @@ final class IcomRadioController: ObservableObject {
                                         enableTx: RadioSettings.enableTx,
                                         builder: makeBuilder(username, password, computer))
         // Watchdog runs from socket-ready: a connect that can't complete its
-        // handshake within 5 s (radio off, port bind collision) is declared
-        // dead instead of waiting forever.
+        // handshake (radio off, port bind collision) — or an established
+        // session that goes silent — is declared dead within 5 s. (Our pings
+        // run every 3 s to match the Android cadence, so the timeout must
+        // exceed one ping period plus jitter.)
         control.linkTimeout = 5
         control.onState = { [weak self] text in self?.onMain { self?.statusText = text } }
         control.onConnected = { [weak self] up in self?.handleControlConnected(up) }
@@ -157,6 +159,36 @@ final class IcomRadioController: ObservableObject {
         return false
     }
 
+    // Whether the lightweight conninfo nudge has already been tried for the
+    // current audio-death episode (main-confined).
+    private var audioNudgeAttempted = false
+
+    /// The radio stopped streaming PCM. First try re-sending the conninfo
+    /// over the (still healthy) control link — that usually restarts the
+    /// radio's audio session in under a second. Only if PCM stays dead for
+    /// another watchdog period escalate to a full reconnect. Main thread.
+    private func handleAudioDeath() {
+        guard !userInitiatedDisconnect, connectionState == .connected else {
+            handleControlConnected(false)
+            return
+        }
+        if !audioNudgeAttempted {
+            audioNudgeAttempted = true
+            appLog("Icom: audio PCM stopped — nudging with a fresh conninfo before reconnecting")
+            streamsLock.lock()
+            let control = controlStream, audio = audioStream
+            streamsLock.unlock()
+            control?.queue.async { control?.resendConnInfo() }
+            audio?.queue.async { audio?.rearmAfterNudge() }
+            // The flag is cleared only by onPcmResumed — if PCM stays dead,
+            // the next watchdog firing escalates to a full reconnect.
+        } else {
+            appLog("Icom: conninfo nudge didn't revive the audio stream — full reconnect")
+            audioNudgeAttempted = false
+            handleControlConnected(false)
+        }
+    }
+
     private func handleControlConnected(_ up: Bool) {
         onMain {
             if up {
@@ -190,17 +222,19 @@ final class IcomRadioController: ObservableObject {
         }
         reconnectAttempts += 1
         let attempt = reconnectAttempts
-        let delay = min(Double(attempt) * 2.0, 8.0)
+        // First retry almost immediately (the sockets were just released);
+        // back off only if the radio stays unreachable.
+        let delay = attempt == 1 ? 0.5 : min(Double(attempt - 1) * 2.0, 8.0)
         connectionState = .connecting
         statusText = "Connection lost — reconnecting (\(attempt)/\(maxReconnectAttempts))…"
-        appLog("Icom: link lost — reconnect attempt \(attempt)/\(maxReconnectAttempts) in \(Int(delay)) s")
+        appLog("Icom: link lost — reconnect attempt \(attempt)/\(maxReconnectAttempts) in \(String(format: "%.1f", delay)) s")
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self, !self.userInitiatedDisconnect,
                   self.reconnectAttempts == attempt,
                   self.connectionState == .connecting else { return }
             self.openConnection()
-            // If this attempt hasn't established within 8 s, move on.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) { [weak self] in
+            // If this attempt hasn't established within 6 s, move on.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6.0) { [weak self] in
                 guard let self, !self.userInitiatedDisconnect,
                       self.reconnectAttempts == attempt,
                       self.connectionState == .connecting else { return }
@@ -254,17 +288,20 @@ final class IcomRadioController: ObservableObject {
         let audio = IcomAudioStream(host: host, port: RadioSettings.audioPort,
                                     enableTx: RadioSettings.enableTx,
                                     builder: makeBuilder(username, password, computer))
-        // From socket-ready: no PCM within 15 s (handshake stuck on a port
-        // bind collision, or the radio not streaming) → dead → reconnect.
-        audio.linkTimeout = 15
+        // From socket-ready: no PCM within 6 s (handshake stuck on a port
+        // bind collision, or the radio not streaming) → declared dead.
+        // Healthy PCM is a continuous 100 pkt/s, so 6 s is unambiguous.
+        audio.linkTimeout = 6
         audio.onRxAudio = { [weak self] samples in self?.onRxAudio?(samples) }
         audio.onState = { text in appLog("Icom[audio]: \(text)") }
         audio.onConnected = { [weak self] up in
             appLog("Icom[audio]: connected=\(up)")
             // The radio can silently stop streaming PCM while its control
-            // session stays alive — treat audio death as session death so
-            // the reconnect rebuilds the conninfo/audio state.
-            if !up { self?.handleControlConnected(false) }
+            // session stays alive (a firmware quirk after some overs).
+            if !up { self?.onMain { self?.handleAudioDeath() } }
+        }
+        audio.onPcmResumed = { [weak self] in
+            self?.onMain { self?.audioNudgeAttempted = false }
         }
 
         streamsLock.lock(); serialStream = serial; audioStream = audio; streamsLock.unlock()
@@ -302,9 +339,21 @@ final class IcomRadioController: ObservableObject {
     private func scheduleInitialFreeDVConfig(attempt: Int = 1) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
             guard let self, self.isConnected else { return }
-            if self.frequencyHz == 0, attempt < 4 {
+            if self.frequencyHz == 0 {
+                guard attempt < 4 else {
+                    // Never configure blind — a freq=0 fallback once forced
+                    // USB-D on a 40 m dial. The first PTT configures correctly.
+                    appLog("Icom: frequency still unknown — leaving FreeDV config to the first PTT")
+                    return
+                }
                 appLog("Icom: frequency not read yet — delaying FreeDV config (try \(attempt))")
-                self.withSerial { $0.sendCiv(self.civ.readFrequencyFrame()) }
+                self.withSerial { serial in
+                    // The CI-V pipe may never have opened (the open request
+                    // is a single unacknowledged packet) — re-open with the
+                    // retry, then poll again.
+                    serial.resendOpen()
+                    serial.sendCiv(self.civ.readFrequencyFrame())
+                }
                 self.scheduleInitialFreeDVConfig(attempt: attempt + 1)
                 return
             }
@@ -353,6 +402,21 @@ final class IcomRadioController: ObservableObject {
     /// FreeDV transmit.
     func configureForFreeDVTransmit() {
         let hz = frequencyHz
+        if hz == 0 {
+            // Frequency unknown (early-session CI-V silence): never guess the
+            // sideband — a blind USB-D once hit a 40 m dial. Turn on data mode
+            // in the radio's CURRENT mode and set the WLAN input; the sideband
+            // rule applies as soon as the frequency readback lands.
+            appLog("Icom: configuring data mode + DATA MOD=WLAN (frequency unknown — keeping current sideband)")
+            withSerial {
+                $0.sendCiv(self.civ.setDataModeFrame(on: true))
+                $0.sendCiv(self.civ.setDataModInputFrame(.wlan))
+                $0.sendCiv(self.civ.readModeDataFrame())
+                $0.sendCiv(self.civ.readDataModInputFrame())
+                $0.sendCiv(self.civ.readFrequencyFrame())
+            }
+            return
+        }
         let mode = freeDVMode(forHz: hz)
         appLog("Icom: configuring \(mode)-D + DATA MOD=WLAN for FreeDV TX (freq=\(hz) Hz)")
         withSerial {
@@ -391,10 +455,12 @@ final class IcomRadioController: ObservableObject {
     }
 
     /// Mark the end of TX audio (PTT released, EOO + padding queued) so the
-    /// audio stream classifies the final FIFO drain as a normal flush — PTT
-    /// itself stays keyed for the drain period.
+    /// audio stream classifies the final FIFO drain as a normal flush. The
+    /// stream keeps sending (silence) frames until PTT actually drops —
+    /// stopping frames while the radio is still keyed makes it declare the
+    /// client disconnected and kill the audio session.
     func noteTxAudioFlushing() {
         streamsLock.lock(); let audio = audioStream; streamsLock.unlock()
-        audio?.queue.async { audio?.setTxActive(false) }
+        audio?.queue.async { audio?.noteFlushing() }
     }
 }

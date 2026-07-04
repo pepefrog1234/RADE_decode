@@ -26,6 +26,15 @@ final class IcomControlStream: IcomUDPStream {
     /// Fired once the control link is fully established (capabilities received).
     var onFullyConnected: (() -> Void)?
 
+    /// Re-send the stream request (conninfo). Nudges the radio's audio
+    /// session back to life when it stops streaming PCM after an over —
+    /// much gentler than a full reconnect. Call on the stream queue.
+    func resendConnInfo() {
+        appLog("Icom[control]: re-sending conninfo (audio session nudge)")
+        send(data: builder.connInfoPacket(radioName: radioName, civPort: civPort,
+                                          audioPort: audioPort, enableRx: true, enableTx: enableTx))
+    }
+
     init(host: String, controlPort: UInt16, civPort: UInt16, audioPort: UInt16,
          enableTx: Bool, builder: IcomPacketBuilder) {
         self.civPort = civPort
@@ -193,6 +202,13 @@ final class IcomSerialStream: IcomUDPStream {
         send(data: builder.disconnectPacket())
         send(data: builder.openClosePacket(open: false))
         armIdleTimer()
+    }
+
+    /// Re-send the CI-V open request. The initial open is a single UDP
+    /// packet with no retry — losing it leaves the radio silently ignoring
+    /// all CI-V traffic (observed as 17 s of unanswered frequency reads).
+    func resendOpen() {
+        send(data: builder.openClosePacket(open: true))
     }
 
     /// Send a raw CI-V payload (already framed fe fe … fd).
@@ -434,12 +450,31 @@ final class IcomAudioStream: IcomUDPStream {
     /// this, not against pings, so "radio silently stopped streaming audio
     /// while still answering pings" is detected and triggers a reconnect.
     private var lastPcmDate = Date()
+    /// Fired (on the stream queue) when PCM starts flowing again after a
+    /// gap longer than the watchdog timeout — lets the controller know a
+    /// nudge actually worked.
+    var onPcmResumed: (() -> Void)?
 
     override var linkWatchdogReferenceDate: Date { lastPcmDate }
 
     /// Never judge PCM silence while we transmit — the radio may legitimately
     /// pause its RX stream during our TX.
     override var linkWatchdogSuppressed: Bool { txActive }
+
+    /// After a conninfo nudge: restart the PCM silence window so the radio
+    /// gets one more timeout period to resume streaming before the
+    /// controller escalates to a full reconnect.
+    func rearmAfterNudge() {
+        lastPcmDate = Date()
+        armLinkWatchdog()
+    }
+
+    /// Called when the end-of-over flush is queued (PTT stays keyed until
+    /// the tail drains). Classification only — frames keep flowing until
+    /// PTT actually drops.
+    func noteFlushing() {
+        txFlushing = true
+    }
 
     /// TX audio gets the WMM voice queue and exemption from WiFi power-save
     /// batching — paced packets must not stall during WiFi housekeeping.
@@ -473,13 +508,21 @@ final class IcomAudioStream: IcomUDPStream {
     private lazy var rxJitter = AudioJitterBuffer { [weak self] samples in
         self?.handleOrderedRxAudio(samples)
     }
-    /// Mirrors PTT (set via setTxActive) so drain events can be classified:
-    /// PTT down = mid-over underrun (bad), PTT up = end-of-over flush (normal).
+    /// Mirrors PTT. CRITICAL: while this is true the radio is keyed with
+    /// WLAN as its modulation source and MUST keep receiving audio frames —
+    /// starving it for a few hundred ms makes it declare the client
+    /// disconnected (radio shows "connection interrupted") and kill the
+    /// whole audio session. Silence frames are sent whenever the FIFO has
+    /// no real audio and PTT is down.
     private var txActive = false
+    /// End-of-over flush in progress (EOO queued, PTT still keyed for the
+    /// drain) — used only to classify the FIFO-drained log line.
+    private var txFlushing = false
 
     /// Called (on the stream queue) when PTT changes.
     func setTxActive(_ active: Bool) {
         txActive = active
+        txFlushing = false
         // Restart the PCM-silence window at both PTT edges so the watchdog
         // never counts time spent transmitting (see linkWatchdogSuppressed).
         lastPcmDate = Date()
@@ -544,7 +587,7 @@ final class IcomAudioStream: IcomUDPStream {
                 // Refill the whole prebuffer before resuming either way.
                 txDraining = false
                 txUnderrunCount += 1
-                if txActive {
+                if txActive && !txFlushing {
                     appLog("Icom[audio]: TX FIFO drained #\(txUnderrunCount) after \(txRealPacketCount) frames — MID-OVER UNDERRUN (encoder starved)")
                 } else {
                     appLog("Icom[audio]: TX FIFO drained #\(txUnderrunCount) after \(txRealPacketCount) frames (end-of-over flush, normal)")
@@ -600,12 +643,9 @@ final class IcomAudioStream: IcomUDPStream {
                 send(data: builder.areYouReadyPacket())
                 invalidateTimers()
                 armPingTimer()
-                // Watches the PCM flow (see linkWatchdogReferenceDate): if the
-                // radio stops streaming RX audio for 15 s — even while still
-                // answering pings — the controller does a full reconnect,
-                // which re-sends conninfo and restores the audio session.
+                // Restart the PCM watchdog (timeout comes from the controller;
+                // reference date is PCM-specific, see linkWatchdogReferenceDate).
                 lastPcmDate = Date()
-                linkTimeout = 15
                 armLinkWatchdog()
                 startTxPacing()
             }, onIAmReady: { })
@@ -620,14 +660,18 @@ final class IcomAudioStream: IcomUDPStream {
     /// ~48000 samples/s confirms the negotiated 48 kHz LPCM stream is arriving
     /// (~8000 would mean the radio ignored the rate and stayed at 8 kHz).
     private func noteRxAudio(_ payloadBytes: Int) {
-        lastPcmDate = Date()
+        let now = Date()
+        if linkTimeout > 0, now.timeIntervalSince(lastPcmDate) > linkTimeout {
+            appLog("Icom[audio]: RX PCM resumed after \(Int(now.timeIntervalSince(lastPcmDate))) s gap")
+            onPcmResumed?()
+        }
+        lastPcmDate = now
         if !rxAudioStarted {
             rxAudioStarted = true
             appLog("Icom[audio]: RX audio streaming started (\(payloadBytes)-byte payload)")
         }
         rxWindowPackets += 1
         rxWindowBytes += payloadBytes
-        let now = Date()
         guard let start = rxWindowStart else { rxWindowStart = now; return }
         let dt = now.timeIntervalSince(start)
         if dt >= 5 {

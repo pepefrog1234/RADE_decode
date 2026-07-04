@@ -40,12 +40,12 @@ class IcomUDPStream {
     var disconnecting = false
     private(set) var current = Data()
 
-    // Ping every 500 ms (wfview's PING_PERIOD): during transmit the HF field
-    // stresses the 2.4 GHz link, and at 3 s cadence a couple of lost pings
-    // meant 6-9 s of silence — enough for the radio's watchdog to drop the
-    // session right around the end of an over.
-    private let pingInterval = 0.5
-    private let idleInterval = 1.0
+    // Keepalive cadence matches the proven Android implementation exactly:
+    // pings every 3 s, idle packets every 100 ms (tracked, control/serial
+    // only — the idle stream keeps the tracked-sequence space dense so the
+    // radio's loss detection and our retransmit substitution stay aligned).
+    private let pingInterval = 3.0
+    private let idleInterval = 0.1
     private let retryInterval = 5.0
 
     // MARK: Link watchdog
@@ -69,9 +69,12 @@ class IcomUDPStream {
     /// its RX PCM stream then).
     var linkWatchdogSuppressed: Bool { false }
 
-    // Retransmit tracking (bounded). 64 packets ≈ 1.3 s of paced TX audio —
-    // deep enough to answer retransmit requests after a WiFi loss burst.
-    private static let trackDepth = 64
+    // Retransmit tracking (bounded). 256 packets ≈ 2.5 s of TX audio at the
+    // 48 kHz rate (100 pkt/s) — deep enough to answer retransmit requests
+    // even after an iOS AWDL/scan burst. Falling out of this window is
+    // poisonous: the fallback substitutes an idle packet into the audio
+    // sequence space, which the radio's audio session tolerates badly.
+    private static let trackDepth = 256
     private var trackedOrder: [UInt16] = []
     private var trackedData: [UInt16: Data] = [:]
     private var totalRetransmit = 0
@@ -259,7 +262,13 @@ class IcomUDPStream {
         guard current.count >= ControlField.dataLength else { return false }
         guard current[c.type].u16 == ControlPacketType.retransmit else { return false }
         let sequences = parseRetransmitRequest(current)
-        for s in sequences { send(data: tracked(sequence: s)) }
+        for s in sequences {
+            // Send twice, like the Android implementation — the link just
+            // proved lossy, and an unanswered retransmit kills the session.
+            let packet = tracked(sequence: s)
+            send(data: packet)
+            send(data: packet)
+        }
         totalRetransmit &+= sequences.count
         // Direct evidence of packet loss on the WiFi link (e.g. HF RF
         // desensing 2.4 GHz during transmit) — worth surfacing every time.
@@ -267,6 +276,11 @@ class IcomUDPStream {
         return true
     }
 
+    /// 16-byte request: single sequence (bytes 6-7). Longer (0x18+) requests
+    /// carry (start, end) RANGE pairs from byte 16 — every sequence in each
+    /// range must be resent. (Parsing these as individual sequences used to
+    /// skip the whole middle of the range; the radio's retransmit protocol
+    /// then failed and it dropped the session as "connection interrupted".)
     private func parseRetransmitRequest(_ data: Data) -> [UInt16] {
         typealias c = ControlField
         if data.count == ControlField.dataLength {
@@ -274,8 +288,15 @@ class IcomUDPStream {
         }
         var result: [UInt16] = []
         var i = 16
-        while i + 2 <= data.count {
-            result.append(Data(data[i..<i+2]).u16)
+        while i + 4 <= data.count {
+            let start = Data(data[i..<i+2]).u16
+            let end = Data(data[i+2..<i+4]).u16
+            var s = start
+            while result.count < 512 {
+                result.append(s)
+                if s == end { break }
+                s = s &+ 1
+            }
             i += 4
         }
         return result
@@ -355,7 +376,11 @@ class IcomUDPStream {
             connection?.cancel()
         } else {
             armIdleTimer()
-            send(data: builder.idlePacket())
+            // Tracked, like the Android implementation — a lost idle is then
+            // resendable instead of leaving a hole in the sequence space.
+            let packet = builder.idlePacket()
+            track(data: packet)
+            send(data: packet)
         }
     }
 
