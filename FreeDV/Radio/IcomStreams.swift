@@ -315,11 +315,17 @@ private final class ModemUpsampler {
 /// 48 kHz → 8 kHz FIR decimator, ported from RADE_decode_Android's
 /// audio_engine.cpp (designDecimFilter / feedNetRx): windowed-sinc lowpass
 /// with cutoff 4 kHz (output Nyquist), 48 taps per phase (288 total),
-/// 4-term Blackman-Harris window, unity DC gain. No attenuation — RADE
-/// takes the radio's line level directly in this pipeline.
+/// 4-term Blackman-Harris window, unity DC gain.
+///
+/// The 0.15 attenuation is Android's NET_RX_ATTEN, applied identically:
+/// RS-BA1 network audio arrives near the radio's digital line level, much
+/// hotter than the |x| ≈ 1.0 (int16/8192) scale the RADE decoder is
+/// designed and tested around — the Android port decodes weak signals
+/// better with this in place.
 private final class ModemDownsampler {
     private static let factor = 6
     private static let totalTaps = 48 * 6
+    private static let netRxAttenuation: Float = 0.15
     private static let taps: [Float] = {
         let total = totalTaps
         let m = Float(total - 1)
@@ -361,6 +367,7 @@ private final class ModemDownsampler {
                     if idx < 0 { idx = total - 1 }
                     acc += hist[idx] * taps[k]
                 }
+                acc *= ModemDownsampler.netRxAttenuation
                 out.append(Int16(max(-32767, min(32767, acc))))
             }
         }
@@ -368,16 +375,23 @@ private final class ModemDownsampler {
     }
 }
 
-/// Minimal in-order jitter buffer over the 16-bit outer packet sequence,
-/// ported from the Android implementation: releases contiguous packets
-/// immediately; if the next expected packet is missing and the buffer grows
-/// past `maxDepth`, skips forward to the oldest buffered packet so audio
-/// never stalls. Single-threaded (audio stream queue only).
+/// In-order jitter buffer over the 16-bit outer packet sequence (Android
+/// pattern, plus loss recovery): releases contiguous packets immediately;
+/// when the next expected packet is missing while newer ones queue up, it
+/// asks (once per sequence) for a retransmit from the radio — WiFi loss
+/// bursts (iOS AWDL scans) then heal instead of punching holes in the modem
+/// stream. If the gap still isn't filled by `maxDepth` packets, it skips
+/// forward so audio never stalls. Single-threaded (audio stream queue only).
 private final class AudioJitterBuffer {
     private var buf: [UInt16: [Int16]] = [:]
     private var expected = -1
     private let maxDepth = 24
     private let onSamples: ([Int16]) -> Void
+    /// Ask the radio to resend this missing sequence.
+    var onMissing: ((UInt16) -> Void)?
+    private var requested: Set<UInt16> = []
+    private(set) var lostPackets = 0
+    private(set) var recoveredPackets = 0
 
     init(onSamples: @escaping ([Int16]) -> Void) {
         self.onSamples = onSamples
@@ -385,22 +399,36 @@ private final class AudioJitterBuffer {
 
     func add(seq: UInt16, samples: [Int16]) {
         if expected < 0 { expected = Int(seq) }
-        if seqLess(seq, UInt16(truncatingIfNeeded: expected)) { return }
+        let exp = UInt16(truncatingIfNeeded: expected)
+        if seqLess(seq, exp) { return }
+        if requested.contains(seq) { recoveredPackets += 1 }
         buf[seq] = samples
         drain()
+        // Gap blocking the head: newer packets queued while `expected` is
+        // missing — request it once, giving the retransmit a round trip to
+        // land before the depth limit forces a skip.
+        if !buf.isEmpty {
+            let head = UInt16(truncatingIfNeeded: expected)
+            if buf[head] == nil, buf.count >= 2, !requested.contains(head) {
+                requested.insert(head)
+                onMissing?(head)
+            }
+        }
         if buf.count > maxDepth {
             var oldest: UInt16?
             for k in buf.keys where oldest == nil || seqLess(k, oldest!) { oldest = k }
             if let o = oldest {
+                lostPackets += (Int(o) - expected) & 0xFFFF
                 expected = Int(o)
                 drain()
             }
         }
+        if requested.count > 64 { requested.removeAll(keepingCapacity: true) }
     }
 
     private func drain() {
         while let s = buf.removeValue(forKey: UInt16(truncatingIfNeeded: expected)) {
-            onSamples(s)
+            if !s.isEmpty { onSamples(s) }
             expected = (expected + 1) & 0xFFFF
         }
     }
@@ -505,8 +533,28 @@ final class IcomAudioStream: IcomUDPStream {
     private var txUnderrunCount = 0
     private let txUpsampler = ModemUpsampler()
     private let rxDownsampler = ModemDownsampler()
-    private lazy var rxJitter = AudioJitterBuffer { [weak self] samples in
-        self?.handleOrderedRxAudio(samples)
+    private lazy var rxJitter: AudioJitterBuffer = {
+        let jitter = AudioJitterBuffer { [weak self] samples in
+            self?.handleOrderedRxAudio(samples)
+        }
+        jitter.onMissing = { [weak self] seq in
+            self?.requestRxRetransmit(seq)
+        }
+        return jitter
+    }()
+    private var rxRetransmitRequests = 0
+
+    /// Ask the radio to resend a lost packet (double-send — the link just
+    /// proved lossy). Recovered packets fill the jitter gap in order instead
+    /// of leaving a hole in the modem stream.
+    private func requestRxRetransmit(_ seq: UInt16) {
+        let p = builder.retransmitRequestPacket(sequence: seq)
+        send(data: p)
+        send(data: p)
+        rxRetransmitRequests += 1
+        if rxRetransmitRequests <= 5 || rxRetransmitRequests % 25 == 0 {
+            appLog("Icom[audio]: RX retransmit requested seq=\(seq) (req \(rxRetransmitRequests), lost \(rxJitter.lostPackets), recovered \(rxJitter.recoveredPackets))")
+        }
     }
     /// Mirrors PTT. CRITICAL: while this is true the radio is keyed with
     /// WLAN as its modulation source and MUST keep receiving audio frames —
@@ -637,6 +685,15 @@ final class IcomAudioStream: IcomUDPStream {
         }
         switch current.count {
         case ControlField.dataLength:
+            typealias c = ControlField
+            if current[c.type].u16 == ControlPacketType.idle {
+                // The radio's idle keepalives share its tracked sequence
+                // space with the audio packets — feed them to the jitter
+                // buffer as empty fillers so they don't register as lost
+                // audio (and retransmit-substituted idles close their gap).
+                rxJitter.add(seq: current[c.sequence].u16, samples: [])
+                return
+            }
             _ = handleControlHandshake(onIAmHere: {
                 onConnected?(true)
                 onState?("Audio connected")
@@ -676,8 +733,9 @@ final class IcomAudioStream: IcomUDPStream {
         let dt = now.timeIntervalSince(start)
         if dt >= 5 {
             let samplesPerSec = Double(rxWindowBytes) / 2.0 / dt
-            appLog(String(format: "Icom[audio]: RX %.1f pkt/s, ~%.0f samples/s",
-                          Double(rxWindowPackets) / dt, samplesPerSec))
+            appLog(String(format: "Icom[audio]: RX %.1f pkt/s, ~%.0f samples/s (lost %d, recovered %d)",
+                          Double(rxWindowPackets) / dt, samplesPerSec,
+                          rxJitter.lostPackets, rxJitter.recoveredPackets))
             rxWindowStart = now
             rxWindowPackets = 0
             rxWindowBytes = 0

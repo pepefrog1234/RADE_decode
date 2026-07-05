@@ -2102,6 +2102,13 @@ class AudioManager: ObservableObject {
         var shouldEnqueue = false
         processingBackpressureLock.lock()
         var effectiveMaxPending = maxPendingProcessingChunks
+        if !backgroundMode && RadioSettings.audioInputSource == .icomRadio {
+            // Network RX arrives at a metronomic 10 chunks/s and every dropped
+            // chunk is a 100 ms hole that breaks weak-signal sync. A deeper
+            // queue (2.4 s) rides out decode bursts instead of dropping;
+            // latency drains back once the burst passes.
+            effectiveMaxPending = 24
+        }
         if backgroundMode {
             effectiveMaxPending = maxPendingProcessingChunksInBackground
             let isSynced = isModemSyncedForBackground

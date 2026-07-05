@@ -75,6 +75,18 @@ final class IcomPacketBuilder {
         return idleTemplate!
     }
 
+    /// Ask the radio to resend a tracked packet we never received (type 0x01).
+    func retransmitRequestPacket(sequence: UInt16) -> Data {
+        typealias c = ControlField
+        var p = Data(count: c.dataLength)
+        p[c.length] = Data(le: UInt32(c.dataLength))
+        p[c.type] = Data(le: ControlPacketType.retransmit)
+        p[c.sequence] = Data(le: sequence)
+        p[c.sendId] = Data(le: myId)
+        if let remoteId { p[c.recvId] = Data(le: remoteId) }
+        return p
+    }
+
     func areYouTherePacket() -> Data {
         typealias c = ControlField
         var p = Data(count: c.dataLength)
