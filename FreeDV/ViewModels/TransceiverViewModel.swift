@@ -56,7 +56,6 @@ class TransceiverViewModel: ObservableObject {
     
     // FFT data for spectrum display
     @Published var fftData: [Float] = Array(repeating: -100, count: 512)
-    @Published var waterfallHistory: [[Float]] = []
     
     // Device info
     @Published var currentInputDevice: String = NSLocalizedString("Unknown", comment: "Unknown audio input device")
@@ -103,7 +102,6 @@ class TransceiverViewModel: ObservableObject {
     @Published var backgroundAnalysisTasks: [BackgroundAnalysisTask] = []
     
     private var statusTimer: Timer?
-    private let maxWaterfallRows = 100
     private var currentTimerInterval: TimeInterval = 0.15
     /// Prevent Task accumulation — skip tick if previous Task is still running
     private var isProcessingTick = false
@@ -187,11 +185,6 @@ class TransceiverViewModel: ObservableObject {
                         let newFFT = self.audioManager.fftData
                         if newFFT != self.fftData {
                             self.fftData = newFFT
-                            self.waterfallHistory.append(newFFT)
-                            let excess = self.waterfallHistory.count - self.maxWaterfallRows
-                            if excess > 0 {
-                                self.waterfallHistory.removeFirst(excess)
-                            }
                         }
                     }
                     

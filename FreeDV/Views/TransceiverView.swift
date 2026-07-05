@@ -65,41 +65,25 @@ struct TransceiverView: View {
                                                     : Color.white.opacity(0.1),
                                                     lineWidth: 0.8)
                                     )
-                            } else if viewModel.effectiveFFTEnabled {
+                            } else {
+                                // Spectrum (when FFT is on) + band activity from
+                                // FreeDV Reporter — the waterfall is gone: it cost
+                                // CPU and finding active frequencies is what the
+                                // activity list does better.
                                 VStack(spacing: 1) {
-                                    SpectrumView(fftData: viewModel.fftData)
-                                        .frame(height: geo.size.height * 0.18)
-
-                                    WaterfallView(history: viewModel.waterfallHistory)
-                                        .frame(height: geo.size.height * 0.22)
+                                    if viewModel.effectiveFFTEnabled {
+                                        SpectrumView(fftData: viewModel.fftData)
+                                            .frame(height: geo.size.height * 0.16)
+                                    }
+                                    BandActivityView(reporter: reporter, viewModel: viewModel)
+                                        .frame(maxWidth: .infinity)
+                                        .frame(height: geo.size.height * (viewModel.effectiveFFTEnabled ? 0.24 : 0.40))
+                                        .background(Color.white.opacity(0.03))
                                 }
                                 .clipShape(RoundedRectangle(cornerRadius: 8))
                                 .overlay(
                                     RoundedRectangle(cornerRadius: 8)
                                         .stroke(Color.white.opacity(0.1), lineWidth: 0.5)
-                                )
-                            } else {
-                                VStack(spacing: 8) {
-                                    Image(systemName: "gauge.with.dots.needle.33percent")
-                                        .font(.system(size: 18))
-                                        .foregroundStyle(.orange.opacity(0.9))
-                                    if viewModel.autoLowLoadModeActive {
-                                        Text("Auto low-load mode enabled")
-                                            .font(.system(size: 12, weight: .semibold))
-                                            .foregroundStyle(.orange.opacity(0.95))
-                                    }
-                                    Text("On older devices, turning off FFT / Waterfall can improve sync and decode speed.")
-                                        .font(.system(size: 11))
-                                        .foregroundStyle(.secondary)
-                                        .multilineTextAlignment(.center)
-                                }
-                                .frame(maxWidth: .infinity)
-                                .frame(height: geo.size.height * 0.40)
-                                .background(Color.white.opacity(0.03))
-                                .clipShape(RoundedRectangle(cornerRadius: 8))
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 8)
-                                        .stroke(Color.orange.opacity(0.25), lineWidth: 0.8)
                                 )
                             }
                         }
@@ -149,6 +133,10 @@ struct TransceiverView: View {
                 }
             }
             .navigationTitle("RADE Decode")
+            // Inline title: the band-activity / TX-reports scroll views would
+            // otherwise drive the collapsible large title, making "RADE
+            // Decode" slide down when the list is pulled.
+            .navigationBarTitleDisplayMode(.inline)
             #if os(iOS)
             .toolbarColorScheme(.dark, for: .navigationBar)
             .toolbarBackground(Color(white: 0.08), for: .navigationBar)

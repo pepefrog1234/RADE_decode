@@ -371,12 +371,21 @@ final class IcomRadioController: ObservableObject {
 
     func setFrequency(_ hz: UInt64) {
         appLog("Icom: set frequency \(hz) Hz")
-        withSerial { $0.sendCiv(self.civ.setFrequencyFrame(hz)) }
+        withSerial {
+            $0.sendCiv(self.civ.setFrequencyFrame(hz))
+            // Read back: the radio doesn't broadcast CI-V-commanded changes,
+            // so without this the app keeps showing the old frequency. The
+            // readback also drives the 10 MHz sideband auto-switch.
+            $0.sendCiv(self.civ.readFrequencyFrame())
+        }
     }
 
     func setMode(_ mode: RadioMode) {
         appLog("Icom: set mode \(mode)")
-        withSerial { $0.sendCiv(self.civ.setModeFrame(mode)) }
+        withSerial {
+            $0.sendCiv(self.civ.setModeFrame(mode))
+            $0.sendCiv(self.civ.readModeDataFrame())
+        }
     }
 
     /// Amateur-band sideband convention: LSB below 10 MHz, USB at/above.
