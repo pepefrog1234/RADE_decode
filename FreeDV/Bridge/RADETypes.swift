@@ -119,6 +119,44 @@ class RADEWrapper {
     /// RX input accumulation buffer
     private var rxInputBuffer: [RADE_COMP] = []
 
+    // MARK: - V2 Real-Audio Frontend
+
+    /// RADE's receiver API consumes analytic (complex IQ) samples. The iOS
+    /// audio path supplies real PCM, so V2 uses the same 127-tap Hilbert
+    /// transform as the upstream rade_rx_wav convenience receiver. V1 keeps
+    /// its established real-only path unchanged.
+    private static let v2HilbertTapCount = 127
+    private static let v2HilbertDelay = (v2HilbertTapCount - 1) / 2
+    private static let v2HilbertCoefficients: [Float] = {
+        let tapCount = v2HilbertTapCount
+        let center = v2HilbertDelay
+        return (0..<tapCount).map { index -> Float in
+            let n = index - center
+            guard n != 0, n & 1 != 0 else { return 0 }
+            let h = 2.0 / (Float.pi * Float(n))
+            let phase = 2.0 * Float.pi * Float(index) / Float(tapCount - 1)
+            let window = 0.54 - 0.46 * cosf(phase)
+            return h * window
+        }
+    }()
+    private var v2HilbertHistory = [Float](repeating: 0, count: v2HilbertTapCount)
+    private var v2HilbertWriteIndex = 0
+
+    /// App-side gain control only. A parallel copy of the validated RADE BPF
+    /// measures in-band power, but its samples are never sent to the decoder;
+    /// gain is applied to the original IQ and the C receiver remains unchanged.
+    private static let v2AGCTarget: Float = powf(10.0, -3.0 / 20.0)
+    private static let v2AGCMinimumGain: Float = 0.1
+    private static let v2AGCMaximumGain: Float = 10.0
+    private static let v2AGCMeterTapCount: Int32 = 101
+    private static let v2AGCMeterBandwidthHz: Float = 975.0
+    private static let v2AGCMeterCentreHz: Float = 1468.75
+    private static let v2AGCMeterMaximumBlock: Int32 = 261
+    private var v2AGCMeterBPF = rade_bpf()
+    private var v2AGCMeterInitialized = false
+    private var v2LastAGCGain: Float = 1.0
+    private var v2PitchClampCount = 0
+
     // MARK: - FARGAN Vocoder State (RX)
 
     /// FARGAN vocoder state for synthesizing speech from decoded features
@@ -262,6 +300,7 @@ class RADEWrapper {
             radePtr = nil
         }
         rxInputBuffer.removeAll(keepingCapacity: false)
+        resetV2InputFrontend()
         txPcmAccum.removeAll(keepingCapacity: false)
         txFeatureAccum.removeAll(keepingCapacity: false)
         openContext()
@@ -295,17 +334,18 @@ class RADEWrapper {
     private let minFramesBetweenEooAttempts = 16   // ~1.9 seconds
 
     /// Process incoming 8kHz mono int16 PCM samples for RX.
-    /// Converts real samples to IQ (real part only, imag = 0), feeds to rade_rx(),
-    /// then synthesizes speech via FARGAN vocoder.
+    /// V1 preserves the established real-only input. V2 converts real PCM to
+    /// analytic IQ and applies app-side bounded AGC using an in-band power
+    /// meter. Both modes synthesize decoded features with the FARGAN vocoder.
     func rxProcessInputSamples(_ samples: UnsafePointer<Int16>, count: Int32) {
         guard let r = radePtr else { return }
 
-        // Convert int16 to RADE_COMP (real = sample/32768, imag = 0)
+        // Convert int16 PCM to the input representation required by this mode.
         let sampleCount = Int(count)
         var peakSample: Float = 0
         for i in 0..<sampleCount {
             let sample = Float(samples[i]) / 32768.0
-            rxInputBuffer.append(RADE_COMP(real: sample, imag: 0))
+            appendRXInputSample(sample)
             peakSample = max(peakSample, abs(sample))
         }
 
@@ -314,6 +354,10 @@ class RADEWrapper {
             flushPendingEooResults()
             let nin = Int(rade_nin(r))
             guard rxInputBuffer.count >= nin else { break }
+
+            if isV2 {
+                v2LastAGCGain = applyV2InputAGC(sampleCount: nin)
+            }
 
             // Call rade_rx
             var hasEoo: Int32 = 0
@@ -325,7 +369,6 @@ class RADEWrapper {
                     }
                 }
             }
-
             // Remove consumed samples (re-check count to guard against concurrent clearInputBuffer)
             guard rxInputBuffer.count >= nin else { break }
             rxInputBuffer.removeFirst(nin)
@@ -351,7 +394,11 @@ class RADEWrapper {
             rxCallCount += 1
             if rxDiagnosticLoggingEnabled && rxCallCount % 8 == 0 {
                 let peakDB = 20 * log10(max(peakSample, 1e-10))
-                appLog("RADE RX: sync=\(syncVal) snr=\(status.snr)dB fOff=\(String(format: "%.1f", status.freqOffset))Hz peak=\(String(format: "%.1f", peakDB))dBFS nin=\(nin) feat=\(nFeatOut) buf=\(rxInputBuffer.count)")
+                let v2Frontend = isV2
+                    ? String(format: " agc=%.2fx pitchClamps=%d",
+                             v2LastAGCGain, v2PitchClampCount)
+                    : ""
+                appLog("RADE RX: sync=\(syncVal) snr=\(status.snr)dB fOff=\(String(format: "%.1f", status.freqOffset))Hz peak=\(String(format: "%.1f", peakDB))dBFS\(v2Frontend) nin=\(nin) feat=\(nFeatOut) buf=\(rxInputBuffer.count)")
             }
 
             // Check for EOO callsign (decode asynchronously, callbacks flushed on RX queue)
@@ -404,6 +451,21 @@ class RADEWrapper {
             // Handle decoded feature frames.
             if nFeatOut > 0 {
                 let totalFeatures = Int(nFeatOut)
+                if isV2 {
+                    // The reference V2 receiver enables this guard by default:
+                    // lower values can drive FARGAN into high-pitched pops or
+                    // sustained buzz on some acoustic speaker/mic channels.
+                    let featureWidth = Int(NB_TOTAL_FEATURES)
+                    for offset in stride(from: 0, to: totalFeatures, by: featureWidth) {
+                        let pitchIndex = offset + 18
+                        guard pitchIndex < totalFeatures else { break }
+                        let pitch = featuresOut[pitchIndex]
+                        if pitch.isFinite && pitch < -1.4 {
+                            featuresOut[pitchIndex] = -1.4
+                            v2PitchClampCount += 1
+                        }
+                    }
+                }
                 // Diagnostic: catch garbage features from the decoder (NaN /
                 // stuck-at-zero) — a silent-corruption canary for the V2 path.
                 if rxDiagnosticLoggingEnabled && rxCallCount % 16 == 0 {
@@ -492,6 +554,86 @@ class RADEWrapper {
                 onEooDetected?(nil)
             }
         }
+    }
+
+    /// Append one real 8 kHz PCM sample to the modem input queue. For V2,
+    /// produce the delayed real component and Hilbert imaginary component with
+    /// streaming state equivalent to rade_rx_wav.c.
+    private func appendRXInputSample(_ sample: Float) {
+        guard isV2 else {
+            rxInputBuffer.append(RADE_COMP(real: sample, imag: 0))
+            return
+        }
+
+        let tapCount = Self.v2HilbertTapCount
+        let writeIndex = v2HilbertWriteIndex
+        v2HilbertHistory[writeIndex] = sample
+
+        var realIndex = writeIndex - Self.v2HilbertDelay
+        if realIndex < 0 { realIndex += tapCount }
+
+        var imag: Float = 0
+        var historyIndex = writeIndex
+        for coefficient in Self.v2HilbertCoefficients {
+            imag += coefficient * v2HilbertHistory[historyIndex]
+            historyIndex -= 1
+            if historyIndex < 0 { historyIndex = tapCount - 1 }
+        }
+
+        rxInputBuffer.append(RADE_COMP(real: v2HilbertHistory[realIndex], imag: imag))
+        v2HilbertWriteIndex = writeIndex + 1
+        if v2HilbertWriteIndex == tapCount { v2HilbertWriteIndex = 0 }
+    }
+
+    /// Estimate the modem-band RMS through a parallel BPF, then scale the
+    /// original IQ block. The receiver's own BPF and decoder are untouched.
+    private func applyV2InputAGC(sampleCount: Int) -> Float {
+        guard sampleCount > 0, rxInputBuffer.count >= sampleCount else { return 1.0 }
+
+        if !v2AGCMeterInitialized {
+            rade_bpf_init(&v2AGCMeterBPF,
+                          Self.v2AGCMeterTapCount,
+                          Float(RADE_MODEM_SAMPLE_RATE),
+                          Self.v2AGCMeterBandwidthHz,
+                          Self.v2AGCMeterCentreHz,
+                          Self.v2AGCMeterMaximumBlock)
+            v2AGCMeterInitialized = true
+        }
+
+        var meterOutput = [RADE_COMP](repeating: RADE_COMP(real: 0, imag: 0),
+                                      count: sampleCount)
+        rxInputBuffer.withUnsafeBufferPointer { inputBuffer in
+            meterOutput.withUnsafeMutableBufferPointer { outputBuffer in
+                rade_bpf_process(&v2AGCMeterBPF,
+                                 outputBuffer.baseAddress,
+                                 inputBuffer.baseAddress,
+                                 Int32(sampleCount))
+            }
+        }
+
+        var power: Float = 0
+        for sample in meterOutput {
+            power += sample.real * sample.real + sample.imag * sample.imag
+        }
+        let rms = sqrtf(power / Float(sampleCount))
+        let gain = min(Self.v2AGCMaximumGain,
+                       max(Self.v2AGCMinimumGain, Self.v2AGCTarget / (rms + 1e-6)))
+
+        for i in 0..<sampleCount {
+            rxInputBuffer[i].real *= gain
+            rxInputBuffer[i].imag *= gain
+        }
+        return gain
+    }
+
+    private func resetV2InputFrontend() {
+        v2HilbertHistory = [Float](repeating: 0, count: Self.v2HilbertTapCount)
+        v2HilbertWriteIndex = 0
+        if v2AGCMeterInitialized {
+            rade_bpf_reset(&v2AGCMeterBPF)
+        }
+        v2LastAGCGain = 1.0
+        v2PitchClampCount = 0
     }
 
     /// Dispatch feature frames to FARGAN queue with overload protection.
@@ -638,6 +780,7 @@ class RADEWrapper {
     /// Clear accumulated RX input samples so stale data doesn't carry over between sessions.
     func clearInputBuffer() {
         rxInputBuffer.removeAll(keepingCapacity: true)
+        resetV2InputFrontend()
     }
 
     // MARK: - TX (Transmit)
