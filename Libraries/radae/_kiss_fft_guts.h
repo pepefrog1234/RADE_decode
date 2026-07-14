@@ -27,8 +27,11 @@ ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
+/* Include guard added for the iOS unity build (kiss_fft.c and
+   kiss_fftr.c both include this header in one translation unit). */
 #ifndef _KISS_FFT_GUTS_H
 #define _KISS_FFT_GUTS_H
+
 
 /* kiss_fft.h
    defines kiss_fft_scalar as either short or a float type

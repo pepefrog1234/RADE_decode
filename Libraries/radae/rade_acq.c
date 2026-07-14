@@ -298,9 +298,6 @@ int rade_acq_check_pilots(rade_acq *acq, const RADE_COMP *rx,
     acq->Dtmax12_eoo = Dtmax12_eoo;
 
     *valid = (Dtmax12 > acq->Dthresh) ? 1 : 0;
-    /* EOO detection is now handled by pilot coherence quality in
-       rade_ofdm_demod_eoo (called every frame in SYNC state).
-       The acq endofover flag is kept for diagnostic/verbose output only. */
     *endofover = (Dtmax12_eoo > Dthresh_eoo) ? 1 : 0;
 
     return *valid;

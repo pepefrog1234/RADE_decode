@@ -14,6 +14,7 @@ struct TransceiverView: View {
     /// from other stations) mostly arrive right as the over ends.
     @State private var showTxReports = false
     @State private var txReportsHoldTask: Task<Void, Never>?
+    @AppStorage(RADEMode.v2Key) private var radeV2Enabled = false
     
     var body: some View {
         NavigationStack {
@@ -42,6 +43,18 @@ struct TransceiverView: View {
                                 Circle()
                                     .fill(.red)
                                     .frame(width: 8, height: 8)
+                                    .padding(.leading, 4)
+                            }
+
+                            // Experimental codec reminder
+                            if radeV2Enabled {
+                                Text("V2 EXPERIMENTAL")
+                                    .font(.system(size: 9, weight: .bold))
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 2)
+                                    .background(Color.orange.opacity(0.25))
+                                    .foregroundStyle(.orange)
+                                    .clipShape(Capsule())
                                     .padding(.leading, 4)
                             }
                         }

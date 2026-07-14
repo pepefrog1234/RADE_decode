@@ -15,6 +15,7 @@ struct SettingsView: View {
     @AppStorage("rxEqCompensationEnabled") private var rxEqCompensationEnabled = false
     @AppStorage("rxEqCompensationGainDb") private var rxEqCompensationGainDb = 4.5
     @AppStorage("audioInputSource") private var audioSourceRaw = AudioInputSource.device.rawValue
+    @AppStorage(RADEMode.v2Key) private var radeV2Enabled = false
 
     /// IC-705 WiFi is the audio source — the reporter frequency follows the
     /// radio dial and is not manually editable.
@@ -118,6 +119,26 @@ struct SettingsView: View {
                 }
             }
             
+            // RADE codec version (V2 experimental)
+            Section {
+                Toggle(isOn: $radeV2Enabled) {
+                    HStack(spacing: 8) {
+                        Text("RADE V2")
+                        Text("EXPERIMENTAL")
+                            .font(.caption2.weight(.bold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.orange.opacity(0.2))
+                            .foregroundStyle(.orange)
+                            .clipShape(Capsule())
+                    }
+                }
+            } header: {
+                Text("Codec")
+            } footer: {
+                Text("⚠️ RADE V2 is an experimental new waveform and is NOT compatible with V1 — both stations must use the same version. V2 has no end-of-over callsign yet. The change takes effect the next time you press START.")
+            }
+
             // IC-705 WiFi radio
             RadioSettingsSection(radio: radioController)
 

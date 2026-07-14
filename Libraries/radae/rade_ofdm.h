@@ -154,11 +154,8 @@ const RADE_COMP* rade_ofdm_get_eoo(const rade_ofdm *ofdm, int *n_out);
 /* Demodulate EOO frame (simpler equalization)
    rx_in: received EOO frame samples
    z_hat: output demodulated symbols
-   quality: if non-NULL, set to sum of per-carrier pilot coherence magnitudes.
-            Real EOO: ~3*Nc (pilots add coherently).  Noise: ~sqrt(3)*Nc.
    Returns number of output floats */
-int rade_ofdm_demod_eoo(const rade_ofdm *ofdm, float *z_hat, const RADE_COMP *rx_in,
-                         int time_offset, float *quality);
+int rade_ofdm_demod_eoo(const rade_ofdm *ofdm, float *z_hat, const RADE_COMP *rx_in, int time_offset);
 
 #ifdef __cplusplus
 }

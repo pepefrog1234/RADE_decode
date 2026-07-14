@@ -1,5 +1,16 @@
 import Foundation
 
+/// App-wide RADE codec version selection. V2 is experimental: a different
+/// waveform, incompatible with V1 stations, applied the next time RX starts.
+enum RADEMode {
+    static let v2Key = "radeV2Enabled"
+    static var v2Enabled: Bool {
+        UserDefaults.standard.bool(forKey: v2Key)   // default: V1
+    }
+    /// Mode string for FreeDV Reporter rx/tx reports.
+    static var reporterModeString: String { v2Enabled ? "RADEV2" : "RADEV1" }
+}
+
 // MARK: - RADE Sync State
 
 /// Sync state for the RADE receiver
@@ -39,6 +50,12 @@ class RADEWrapper {
     }
 
     func rxProcessInputSamples(_ samples: UnsafePointer<Int16>, count: Int32) {
+        // No-op on simulator
+    }
+
+    var isV2: Bool { RADEMode.v2Enabled }
+
+    func reconfigureForSelectedVersionIfNeeded() {
         // No-op on simulator
     }
 
@@ -86,7 +103,9 @@ class RADEWrapper {
 class RADEWrapper {
 
     /// Opaque pointer to C `struct rade`
-    private var radePtr: OpaquePointer?
+    // Upstream rade_api.h now defines `struct rade` publicly, so the API
+    // imports as a typed pointer rather than OpaquePointer.
+    private var radePtr: UnsafeMutablePointer<rade>?
 
     /// Cached buffer sizes from C API
     private var ninMax: Int = 0
@@ -168,16 +187,42 @@ class RADEWrapper {
     /// Parameters: (snr, freqOffset, syncState, nin, hasEoo, callsign)
     var onModemFrameProcessed: ((_ snr: Float, _ freqOffset: Float, _ syncState: Int, _ nin: Int) -> Void)?
 
+    /// True when the current context runs RADE V2 (experimental).
+    private(set) var isV2 = false
+
     init() {
         // Initialize the RADE library
         rade_initialize()
+        openContext()
 
-        // Open RADE context with C encoder and decoder, quiet mode.
+        // Initialize FARGAN vocoder for RX (version-independent).
+        farganState = UnsafeMutablePointer<FARGANState>.allocate(capacity: 1)
+        fargan_init(farganState)
+        warmupBuffer = [Float](repeating: 0,
+                               count: farganWarmupFrames * Int(NB_TOTAL_FEATURES))
+
+        // Initialize LPCNet encoder (transmit path, version-independent).
+        opusArch = freedv_opus_select_arch()
+        lpcnetEncState = lpcnet_encoder_create()
+        if let enc = lpcnetEncState {
+            lpcnet_encoder_init(enc)
+        } else {
+            appLog("RADEWrapper: lpcnet_encoder_create() failed — TX disabled")
+        }
+    }
+
+    /// Open (or re-open) the RADE context in the version selected in settings
+    /// and size every buffer from the API — V1 and V2 differ in frame sizes
+    /// (V1: 432 features / 960 samples; V2: 144 / 320) and V2 has no EOO
+    /// data bits.
+    private func openContext() {
         // RADE_VERBOSE_0 suppresses per-frame fprintf to stderr which causes
         // significant I/O overhead on iOS and degrades real-time decoding.
-        let flags: Int32 = RADE_USE_C_ENCODER | RADE_USE_C_DECODER | RADE_VERBOSE_0
+        var flags: Int32 = RADE_USE_C_ENCODER | RADE_USE_C_DECODER | RADE_VERBOSE_0
+        let wantV2 = RADEMode.v2Enabled
+        if wantV2 { flags |= RADE_MODE_V2 }
         var modelPath = Array("built-in".utf8CString)
-        radePtr = modelPath.withUnsafeMutableBufferPointer { buf -> OpaquePointer? in
+        radePtr = modelPath.withUnsafeMutableBufferPointer { buf -> UnsafeMutablePointer<rade>? in
             return rade_open(buf.baseAddress, flags)
         }
 
@@ -185,6 +230,7 @@ class RADEWrapper {
             print("RADEWrapper: rade_open() failed")
             return
         }
+        isV2 = wantV2
 
         // Cache RADE buffer sizes
         ninMax = Int(rade_nin_max(r))
@@ -195,20 +241,6 @@ class RADEWrapper {
         featuresOut = [Float](repeating: 0, count: nFeaturesInOut)
         eooOut = [Float](repeating: 0, count: max(nEooBits, 1))
 
-        // Initialize FARGAN vocoder for RX
-        farganState = UnsafeMutablePointer<FARGANState>.allocate(capacity: 1)
-        fargan_init(farganState)
-        warmupBuffer = [Float](repeating: 0,
-                               count: farganWarmupFrames * Int(NB_TOTAL_FEATURES))
-
-        // Initialize LPCNet encoder + TX buffers (transmit path).
-        opusArch = freedv_opus_select_arch()
-        lpcnetEncState = lpcnet_encoder_create()
-        if let enc = lpcnetEncState {
-            lpcnet_encoder_init(enc)
-        } else {
-            appLog("RADEWrapper: lpcnet_encoder_create() failed — TX disabled")
-        }
         txFramesPerModemFrame = max(1, nFeaturesInOut / Int(NB_TOTAL_FEATURES))
         txOutBuf = [RADE_COMP](repeating: RADE_COMP(real: 0, imag: 0),
                                count: max(Int(rade_n_tx_out(r)), 1))
@@ -216,7 +248,24 @@ class RADEWrapper {
                                count: max(Int(rade_n_tx_eoo_out(r)), 1))
         eooBits = [Float](repeating: 0, count: max(nEooBits, 1))
 
-        appLog("RADEWrapper: initialized, ninMax=\(ninMax) nFeatures=\(nFeaturesInOut) txOut=\(txOutBuf.count) txEoo=\(txEooBuf.count) framesPerTx=\(txFramesPerModemFrame)")
+        appLog("RADEWrapper: initialized RADE \(isV2 ? "V2 (EXPERIMENTAL)" : "V1"), ninMax=\(ninMax) nFeatures=\(nFeaturesInOut) txOut=\(txOutBuf.count) txEoo=\(txEooBuf.count) framesPerTx=\(txFramesPerModemFrame)")
+    }
+
+    /// Re-open the context if the settings version differs from the running
+    /// one. Only call while decoding is fully stopped (no in-flight
+    /// rxProcessInputSamples / tx work) — the START path does this.
+    func reconfigureForSelectedVersionIfNeeded() {
+        guard RADEMode.v2Enabled != isV2 else { return }
+        appLog("RADEWrapper: switching to RADE \(RADEMode.v2Enabled ? "V2 (EXPERIMENTAL)" : "V1")")
+        if let r = radePtr {
+            rade_close(r)
+            radePtr = nil
+        }
+        rxInputBuffer.removeAll(keepingCapacity: false)
+        txPcmAccum.removeAll(keepingCapacity: false)
+        txFeatureAccum.removeAll(keepingCapacity: false)
+        openContext()
+        resetFargan()
     }
 
     deinit {
@@ -355,6 +404,21 @@ class RADEWrapper {
             // Handle decoded feature frames.
             if nFeatOut > 0 {
                 let totalFeatures = Int(nFeatOut)
+                // Diagnostic: catch garbage features from the decoder (NaN /
+                // stuck-at-zero) — a silent-corruption canary for the V2 path.
+                if rxDiagnosticLoggingEnabled && rxCallCount % 16 == 0 {
+                    var nanCount = 0
+                    var maxAbs: Float = 0
+                    var sum: Float = 0
+                    for i in 0..<totalFeatures {
+                        let v = featuresOut[i]
+                        if v.isNaN || v.isInfinite { nanCount += 1 }
+                        else { maxAbs = max(maxAbs, abs(v)); sum += v }
+                    }
+                    appLog(String(format: "RADE feat stats: nan=%d maxAbs=%.3f mean=%.3f c0=%.3f pitch=%.3f",
+                                  nanCount, maxAbs, sum / Float(totalFeatures),
+                                  featuresOut[0], featuresOut[18]))
+                }
                 if deferredFeatureStorageEnabled && !speechSynthesisEnabled {
                     // Background decode-only mode: write contiguous features directly.
                     featuresOut.withUnsafeBufferPointer { buf in
@@ -431,7 +495,11 @@ class RADEWrapper {
     }
 
     /// Dispatch feature frames to FARGAN queue with overload protection.
-    /// If FARGAN is still busy processing, drop new frames to prevent freeze.
+    /// Frames queue while FARGAN is busy and are only dropped past a real
+    /// backlog depth. (The old "drop whenever busy" rule was invisible with
+    /// V1's 12-frame/120 ms cadence but shredded V2's 4-frame/40 ms stream —
+    /// any synthesis pass still running when the next block arrived threw
+    /// that block away, punching 40 ms holes and tearing vocoder state.)
     private func dispatchFargan(frames: [[Float]]) {
         enqueueFargan(frames: frames, dropIfBusy: true)
     }
@@ -440,22 +508,38 @@ class RADEWrapper {
         enqueueFargan(frames: frames, dropIfBusy: false)
     }
 
+    /// Real-time path may buffer up to ~480 ms of synthesis backlog before
+    /// dropping — enough to ride out warmup and scheduling hiccups; FARGAN
+    /// runs several times faster than real time, so the backlog drains.
+    private let maxPendingFarganFrames = 48
+    /// Guards farganPendingFeatures + farganBusy (touched from the RX
+    /// processing queue and the FARGAN queue).
+    private let farganPendingLock = NSLock()
+
     private func enqueueFargan(frames: [[Float]], dropIfBusy: Bool) {
         guard !frames.isEmpty else { return }
-        if dropIfBusy && farganBusy {
-            appLog("FARGAN: dropping \(frames.count) frames (overloaded)")
+        farganPendingLock.lock()
+        if dropIfBusy && farganPendingFeatures.count + frames.count > maxPendingFarganFrames {
+            let backlog = farganPendingFeatures.count
+            farganPendingLock.unlock()
+            appLog("FARGAN: dropping \(frames.count) frames (backlog \(backlog))")
             return
         }
         farganPendingFeatures.append(contentsOf: frames)
+        farganPendingLock.unlock()
         runFarganQueueIfNeeded()
     }
 
     private func runFarganQueueIfNeeded() {
-        guard !farganBusy, !farganPendingFeatures.isEmpty else { return }
-
+        farganPendingLock.lock()
+        guard !farganBusy, !farganPendingFeatures.isEmpty else {
+            farganPendingLock.unlock()
+            return
+        }
         farganBusy = true
         let framesToProcess = farganPendingFeatures
         farganPendingFeatures.removeAll(keepingCapacity: true)
+        farganPendingLock.unlock()
 
         farganQueue.async { [weak self] in
             guard let self = self else { return }
@@ -469,7 +553,9 @@ class RADEWrapper {
             if elapsed > 0.1 {
                 appLog("FARGAN: \(framesToProcess.count) frames took \(String(format: "%.0f", elapsed * 1000))ms")
             }
+            self.farganPendingLock.lock()
             self.farganBusy = false
+            self.farganPendingLock.unlock()
             self.runFarganQueueIfNeeded()
         }
     }

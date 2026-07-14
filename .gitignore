@@ -13,3 +13,29 @@ DerivedData/
 # Secrets
 .env
 credentials.json
+
+# Opus rebuild artifacts (regenerate: autoreconf + dnn/download_model.sh, see build_opus.sh)
+Libraries/opus/build-*/
+Libraries/opus/autom4te.cache/
+Libraries/opus/configure
+Libraries/opus/config.h.in
+Libraries/opus/Makefile.in
+Libraries/opus/aclocal.m4
+Libraries/opus/INSTALL
+Libraries/opus/compile
+Libraries/opus/config.guess
+Libraries/opus/config.sub
+Libraries/opus/depcomp
+Libraries/opus/install-sh
+Libraries/opus/ltmain.sh
+Libraries/opus/missing
+Libraries/opus/test-driver
+Libraries/opus/m4/
+Libraries/opus/dnn/models/
+Libraries/opus/dnn/*_data.c
+Libraries/opus/dnn/*_data.h
+Libraries/opus/lib/*.backup
+Libraries/opus/lib/*.pre-v2-backup
+freedv_rx_log.csv
+Libraries/opus/doc/Makefile.in
+Libraries/opus/package_version

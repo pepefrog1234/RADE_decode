@@ -1424,7 +1424,11 @@ class AudioManager: ObservableObject {
     
     func startRX() {
         guard !isRunning else { return }
-        
+
+        // Apply a pending RADE V1/V2 switch — safe here because decoding is
+        // fully stopped (no in-flight processing-queue work).
+        radeWrapper.reconfigureForSelectedVersionIfNeeded()
+
         // Foreground: .measurement for raw modem capture.
         // Background: .default for better iOS background stability.
         resetDeferredFeatures()

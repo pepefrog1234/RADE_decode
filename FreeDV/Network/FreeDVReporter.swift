@@ -385,7 +385,7 @@ class FreeDVReporter {
         guard isReady else { return }
         sendEvent("rx_report", [
             "callsign": callsign,
-            "mode": "RADEV1",
+            "mode": RADEMode.reporterModeString,
             "snr": snr
         ])
         appLog("Reporter: rx_report sent — \(callsign) SNR=\(snr)")
@@ -396,7 +396,7 @@ class FreeDVReporter {
     func reportTx(transmitting: Bool) {
         guard isReady else { return }
         sendEvent("tx_report", [
-            "mode": "RADEV1",
+            "mode": RADEMode.reporterModeString,
             "transmitting": transmitting
         ])
         appLog("Reporter: tx_report sent — transmitting=\(transmitting)")
