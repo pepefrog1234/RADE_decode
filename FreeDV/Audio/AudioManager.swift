@@ -2216,17 +2216,21 @@ class AudioManager: ObservableObject {
     
     // MARK: - Audio Output
     
-    /// Makeup gain (+8 dB) for decoded speech — RADE/FARGAN synthesis output
-    /// is conservative and needs help on the iPhone speaker. Peaks are
-    /// clamped; the user volume slider still applies on top at render time.
-    private let speechMakeupGain: Float = 2.5
+    /// V1's conservative FARGAN output needs makeup gain on the quiet
+    /// `.measurement` speaker route. V2 can contain substantially larger
+    /// decoded peaks on an acoustic channel; applying the same +8 dB gain
+    /// hard-clips those peaks and turns intelligible speech into distortion.
+    private let v1SpeechMakeupGain: Float = 2.5
+    private let v2SpeechMakeupGain: Float = 1.0
 
     /// Enqueue decoded speech into the ring buffer for the source node to consume.
     private func playDecodedAudio(samples: UnsafePointer<Int16>, count: Int) {
-        // Convert int16 → float (with makeup gain) and push into ring buffer
+        // Convert int16 → float with mode-appropriate makeup gain. The user
+        // volume slider still applies later in the render callback.
+        let makeupGain = radeWrapper.isV2 ? v2SpeechMakeupGain : v1SpeechMakeupGain
         var floats = [Float](repeating: 0, count: count)
         for i in 0..<count {
-            floats[i] = max(-1.0, min(1.0, Float(samples[i]) * speechMakeupGain / 32768.0))
+            floats[i] = max(-1.0, min(1.0, Float(samples[i]) * makeupGain / 32768.0))
         }
         
         // Calculate output level for meter (skip in background)

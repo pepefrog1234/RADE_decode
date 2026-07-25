@@ -119,7 +119,9 @@ struct SettingsView: View {
                 }
             }
             
-            // RADE codec version (V2 experimental)
+            // RADE codec version (V2 experimental) — hidden while the
+            // upstream V2 waveform is still changing (RADEMode.v2FeatureAvailable).
+            if RADEMode.v2FeatureAvailable {
             Section {
                 Toggle(isOn: $radeV2Enabled) {
                     HStack(spacing: 8) {
@@ -137,6 +139,7 @@ struct SettingsView: View {
                 Text("Codec")
             } footer: {
                 Text("⚠️ RADE V2 is an experimental new waveform and is NOT compatible with V1 — both stations must use the same version. V2 has no end-of-over callsign yet. The change takes effect the next time you press START.")
+            }
             }
 
             // IC-705 WiFi radio

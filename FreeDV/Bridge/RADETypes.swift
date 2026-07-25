@@ -3,9 +3,15 @@ import Foundation
 /// App-wide RADE codec version selection. V2 is experimental: a different
 /// waveform, incompatible with V1 stations, applied the next time RX starts.
 enum RADEMode {
+    /// V2 is hidden while the upstream waveform is still changing — the
+    /// integration stays in the codebase; flip this to bring back the
+    /// Settings toggle and V2 operation. While false, everyone runs V1
+    /// even if the old preference key was previously enabled.
+    static let v2FeatureAvailable = false
+
     static let v2Key = "radeV2Enabled"
     static var v2Enabled: Bool {
-        UserDefaults.standard.bool(forKey: v2Key)   // default: V1
+        v2FeatureAvailable && UserDefaults.standard.bool(forKey: v2Key)
     }
     /// Mode string for FreeDV Reporter rx/tx reports.
     static var reporterModeString: String { v2Enabled ? "RADEV2" : "RADEV1" }

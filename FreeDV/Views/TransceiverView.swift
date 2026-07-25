@@ -47,7 +47,7 @@ struct TransceiverView: View {
                             }
 
                             // Experimental codec reminder
-                            if radeV2Enabled {
+                            if RADEMode.v2FeatureAvailable && radeV2Enabled {
                                 Text("V2 EXPERIMENTAL")
                                     .font(.system(size: 9, weight: .bold))
                                     .padding(.horizontal, 5)
