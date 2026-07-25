@@ -104,28 +104,44 @@ class FreeDVReporter {
         
         didFinishInit = true
         startNetworkMonitoring()
-        
-        // Auto-connect on launch if enabled
-        if isEnabled {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-                self?.connect()
-            }
-        }
+        // No auto-connect on launch: the reporter only goes online while the
+        // app is actually operating (see setOperating).
     }
     
     deinit {
-        disconnect()
+        // Tear down WITHOUT calling disconnect(): that method captures self
+        // in an escaping main-queue closure, and capturing a deiniting
+        // object resurrects it — Swift runtime aborts in
+        // swift_deallocClassInstance (seen in the field when iOS tore down
+        // the SwiftUI scene while backgrounded, TestFlight crash 403368E7).
+        pendingBackgroundDisconnect?.cancel()
+        shouldReconnect = false
+        webSocket?.cancel(with: .goingAway, reason: nil)
+        urlSession?.invalidateAndCancel()
         networkMonitor.cancel()
     }
     
     // MARK: - Connect / Disconnect
-    
+
+    /// True while the app is actually on the air: decoding started, and the
+    /// IC-705 connected when it is the audio source. Until then the app
+    /// stays off qso.freedv.org entirely (no idle presence).
+    private(set) var isOperating = false
+
+    /// Called (cheaply, each UI tick) with the current operating state.
+    func setOperating(_ operating: Bool) {
+        guard operating != isOperating else { return }
+        isOperating = operating
+        appLog("Reporter: operating=\(operating)")
+        updateConnection()
+    }
+
     func updateConnection() {
-        if isEnabled {
+        if isEnabled && isOperating {
             if !isConnected {
                 connect()
             }
-        } else {
+        } else if isConnected || webSocket != nil {
             disconnect()
         }
     }
@@ -148,35 +164,57 @@ class FreeDVReporter {
         receiveMessage()
     }
     
-    func disconnect() {
+    func disconnect(clearStations: Bool = true) {
         shouldReconnect = false
         webSocket?.cancel(with: .goingAway, reason: nil)
         webSocket = nil
         urlSession?.invalidateAndCancel()
         urlSession = nil
-        
-        DispatchQueue.main.async {
+
+        let applyState = {
             self.isConnected = false
             self.isReady = false
-            self.stations.removeAll()
+            if clearStations {
+                self.stations.removeAll()
+            }
+        }
+        if Thread.isMainThread {
+            applyState()
+        } else {
+            DispatchQueue.main.async(execute: applyState)
         }
         appLog("Reporter: disconnected")
     }
 
     // MARK: - App Lifecycle
 
-    /// Called when app enters background to avoid long-lived stale sockets.
+    private var pendingBackgroundDisconnect: DispatchWorkItem?
+
+    /// Called when the app enters the background. Brief app switches keep
+    /// the socket (and the station list) alive via a grace period; only a
+    /// real stay in the background disconnects — and even then the station
+    /// cache is kept so returning shows the last-known list immediately
+    /// while the roster refreshes.
     func suspendForBackground() {
-        guard isEnabled else { return }
+        guard isEnabled, isConnected || webSocket != nil else { return }
         wasSuspendedForBackground = true
-        disconnect()
+        pendingBackgroundDisconnect?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            appLog("Reporter: background grace period expired — disconnecting")
+            self?.disconnect(clearStations: false)
+        }
+        pendingBackgroundDisconnect = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 25, execute: work)
     }
 
     /// Called when app returns to foreground to restore reporter connection.
     func resumeFromBackground() {
+        pendingBackgroundDisconnect?.cancel()
+        pendingBackgroundDisconnect = nil
         guard wasSuspendedForBackground else { return }
         wasSuspendedForBackground = false
-        guard isEnabled else { return }
+        guard isEnabled && isOperating else { return }
+        guard !isConnected else { return }   // socket survived the switch — nothing to do
         connect()
     }
     

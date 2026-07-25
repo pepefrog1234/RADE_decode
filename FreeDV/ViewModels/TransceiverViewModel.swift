@@ -207,6 +207,7 @@ class TransceiverViewModel: ObservableObject {
                     self.radioIsTransmitting = radio.isTransmitting
                 }
                 self.syncReporterFrequencyFromRadio()
+                self.updateReporterOperatingState()
                 self.deferredDecodeInProgress = self.audioManager.deferredDecodeInProgress
                 self.deferredDecodeProgress = self.audioManager.deferredDecodeProgress
                 self.deferredDecodeStatusText = self.audioManager.deferredDecodeStatusText
@@ -249,6 +250,15 @@ class TransceiverViewModel: ObservableObject {
     /// While the IC-705 is the audio source, mirror its dial frequency to the
     /// FreeDV Reporter. Debounced: the value must sit unchanged for 0.5 s
     /// before it is pushed, so spinning the dial doesn't spam freq_change.
+    /// The reporter goes online only while actually operating: decoding
+    /// started (START), and — when the IC-705 is the audio source — the
+    /// radio connected. Idle app = no presence on qso.freedv.org.
+    private func updateReporterOperatingState() {
+        guard let reporter else { return }
+        let operating = isRunning && (!usingRadioSource || radioConnected)
+        reporter.setOperating(operating)
+    }
+
     private func syncReporterFrequencyFromRadio() {
         guard usingRadioSource, radioConnected, radioFrequencyHz > 0,
               let reporter, reporter.frequencyHz != radioFrequencyHz else {
