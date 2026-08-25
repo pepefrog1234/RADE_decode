@@ -104,6 +104,16 @@ class AudioManager: ObservableObject {
     // FreeDV Reporter integration
     var reporter: FreeDVReporter?
 
+    /// Periodic rx_report state — desktop parity: report every 10 s while synced
+    /// (empty callsign allowed, it populates the SNR column on qso.freedv.org),
+    /// plus an immediate report on each new EOO callsign. Decode-queue access only.
+    private var lastRxReportDate: Date = .distantPast
+    private var lastReportedCallsign: String = ""
+    private let rxReportInterval: TimeInterval = 10
+    /// SNR of the most recent modem frame — the published `snr` property is not
+    /// updated in background/deferred modes, so reports read this instead.
+    private var latestFrameSNR: Float = 0
+
     // MARK: - IC-705 WiFi integration
 
     /// Radio controller (set by the view model). Used for network RX/TX audio.
@@ -1116,7 +1126,7 @@ class AudioManager: ObservableObject {
                 appLog("AudioManager: created callsign-only session")
             }
 
-            let currentSNR = self.snr
+            let currentSNR = self.latestFrameSNR
             let frameCount = self.receptionLogger?.currentSession?.totalModemFrames ?? 0
             let isDeferredReplay = self.deferredReplayFastMode
             let logMessage = String(format: "EOO callsign decoded: %@ (SNR=%.1f dB)", normalizedCallsign, currentSNR)
@@ -1139,9 +1149,12 @@ class AudioManager: ObservableObject {
             let lon = isDeferredReplay ? nil : self.locationTracker.longitude
             self.receptionLogger?.recordCallsign(normalizedCallsign, snr: currentSNR, modemFrame: frameCount,
                                                  latitude: lat, longitude: lon)
-            // Report to FreeDV Reporter (qso.freedv.org)
-            if !isDeferredReplay {
-                self.reporter?.reportRx(callsign: normalizedCallsign, snr: Int(currentSNR))
+            // Report to FreeDV Reporter immediately on a new callsign; periodic
+            // SNR reports continue from onModemFrameProcessed.
+            self.lastReportedCallsign = normalizedCallsign
+            if !isDeferredReplay, let reporter = self.reporter, reporter.isReady {
+                reporter.reportRx(callsign: normalizedCallsign, snr: self.reporterSNRInt(currentSNR))
+                self.lastRxReportDate = Date()
             }
         }
 
@@ -1176,7 +1189,26 @@ class AudioManager: ObservableObject {
                 self.backgroundDecodeBoostUntil = Date().addingTimeInterval(self.backgroundDecodeBoostDuration)
             }
             self.processingBackpressureLock.unlock()
-            
+
+            self.latestFrameSNR = snr
+
+            // FreeDV Reporter: periodic rx_report while synced. The SNR column on
+            // qso.freedv.org is only populated by rx_report, so send one every
+            // 10 s with the current SNR even before any callsign is decoded.
+            if !self.deferredReplayFastMode {
+                if isSynced {
+                    if Date().timeIntervalSince(self.lastRxReportDate) >= self.rxReportInterval,
+                       let reporter = self.reporter, reporter.isReady {
+                        reporter.reportRx(callsign: self.lastReportedCallsign,
+                                          snr: self.reporterSNRInt(snr))
+                        self.lastRxReportDate = Date()
+                    }
+                } else {
+                    // Reset so the first report after (re)sync fires immediately
+                    self.lastRxReportDate = .distantPast
+                }
+            }
+
             // Session lifecycle with grace period for brief sync drops
             if self.shouldProcess {
                 if isSynced {
@@ -1246,6 +1278,12 @@ class AudioManager: ObservableObject {
         }
     }
     
+    /// Clamp/sanitize an SNR estimate for the FreeDV Reporter integer dB field.
+    private func reporterSNRInt(_ snr: Float) -> Int {
+        guard snr.isFinite else { return 0 }
+        return Int(max(-127, min(127, snr.rounded())))
+    }
+
     // MARK: - Session Auto-Split
     
     /// End the current reception session and persist to SwiftData.

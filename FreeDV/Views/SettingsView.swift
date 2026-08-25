@@ -26,71 +26,76 @@ struct SettingsView: View {
     var body: some View {
         Form {
             // FreeDV Reporter section
+            // Entry fields stay visible while reporting is off so callsign,
+            // frequency, and status message can be prepared in advance.
             Section("FreeDV Reporter") {
                 Toggle("Enable Reporting", isOn: $reporter.isEnabled)
-                
-                if reporter.isEnabled {
-                    HStack {
-                        Text("Callsign")
-                        Spacer()
-                        TextField("e.g. BV2ABC", text: $reporter.callsign)
-                            .textInputAutocapitalization(.characters)
-                            .autocorrectionDisabled()
-                            .multilineTextAlignment(.trailing)
-                            .frame(maxWidth: 160)
-                    }
-                    
-                    HStack {
-                        Text("Grid Square")
-                        Spacer()
-                        TextField("e.g. PL04qf", text: $reporter.gridSquare)
-                            .autocorrectionDisabled()
-                            .multilineTextAlignment(.trailing)
-                            .frame(maxWidth: 130)
-                        Button {
-                            locationHelper.requestLocation { grid in
-                                reporter.gridSquare = grid
-                            }
-                        } label: {
-                            Image(systemName: locationHelper.isLocating
-                                  ? "location.fill" : "location")
+
+                HStack {
+                    Text("Callsign")
+                    Spacer()
+                    TextField("e.g. BV2ABC", text: $reporter.callsign)
+                        .textInputAutocapitalization(.characters)
+                        .autocorrectionDisabled()
+                        .multilineTextAlignment(.trailing)
+                        .frame(maxWidth: 160)
+                }
+
+                HStack {
+                    Text("Grid Square")
+                    Spacer()
+                    TextField("e.g. PL04qf", text: $reporter.gridSquare)
+                        .autocorrectionDisabled()
+                        .multilineTextAlignment(.trailing)
+                        .frame(maxWidth: 130)
+                    Button {
+                        locationHelper.requestLocation { grid in
+                            reporter.gridSquare = grid
                         }
-                        .disabled(locationHelper.isLocating)
+                    } label: {
+                        Image(systemName: locationHelper.isLocating
+                              ? "location.fill" : "location")
                     }
-                    
-                    if frequencyLockedToRadio {
-                        // Frequency follows the IC-705 dial — shown locked.
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text("Frequency")
-                                    .foregroundStyle(.secondary)
-                                Text("Synced from IC-705")
-                                    .font(.caption)
-                                    .foregroundStyle(.tertiary)
-                            }
-                            Spacer()
-                            Image(systemName: "lock.fill")
+                    .disabled(locationHelper.isLocating)
+                }
+
+                if frequencyLockedToRadio {
+                    // Frequency follows the IC-705 dial — shown locked.
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Frequency")
+                                .foregroundStyle(.secondary)
+                            Text("Synced from IC-705")
                                 .font(.caption)
                                 .foregroundStyle(.tertiary)
-                            Text(formatFrequency(reporter.frequencyHz))
-                                .foregroundStyle(.secondary)
                         }
-                    } else {
-                        NavigationLink {
-                            FrequencyPickerView(frequencyHz: $reporter.frequencyHz)
-                        } label: {
-                            LabeledContent("Frequency", value: formatFrequency(reporter.frequencyHz))
-                        }
-                    }
-                    
-                    HStack {
-                        Text("Status Message")
                         Spacer()
-                        TextField("Optional", text: $reporter.statusMessage)
-                            .multilineTextAlignment(.trailing)
-                            .frame(maxWidth: 200)
+                        Image(systemName: "lock.fill")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                        Text(formatFrequency(reporter.frequencyHz))
+                            .foregroundStyle(.secondary)
                     }
-                    
+                } else {
+                    NavigationLink {
+                        FrequencyPickerView(frequencyHz: $reporter.frequencyHz)
+                    } label: {
+                        LabeledContent("Frequency", value: formatFrequency(reporter.frequencyHz))
+                    }
+                }
+
+                // Leading-aligned editor: a trailing-aligned TextField silently
+                // drops trailing spaces as the observable binding re-renders.
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Status Message")
+                    TextField("Optional", text: $reporter.statusMessage)
+                        .autocorrectionDisabled()
+                        .onSubmit {
+                            if reporter.isReady { reporter.sendMessageUpdate() }
+                        }
+                }
+
+                if reporter.isEnabled {
                     // Connection status
                     HStack {
                         Text("Connection")
