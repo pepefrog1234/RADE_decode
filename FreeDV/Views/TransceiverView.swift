@@ -216,6 +216,10 @@ struct TransceiverView: View {
 struct RadioControlPanel: View {
     @ObservedObject var viewModel: TransceiverViewModel
     @State private var pttActive = false
+    /// Debounced release: a micro touch-loss while pressing hard (finger
+    /// roll, contact-shape change) must not end the over — the touch coming
+    /// back within the window cancels the pending release.
+    @State private var pttReleaseTask: Task<Void, Never>?
 
     private var freqText: String {
         guard viewModel.radioFrequencyHz > 0 else { return "—" }
@@ -263,14 +267,24 @@ struct RadioControlPanel: View {
                 .gesture(
                     DragGesture(minimumDistance: 0)
                         .onChanged { _ in
+                            if let pending = pttReleaseTask {
+                                // Touch back within the debounce window — keep transmitting.
+                                pending.cancel()
+                                pttReleaseTask = nil
+                            }
                             guard !pttActive, viewModel.radioConnected, viewModel.isRunning else { return }
                             pttActive = true
                             viewModel.pttDown()
                         }
                         .onEnded { _ in
-                            guard pttActive else { return }
-                            pttActive = false
-                            viewModel.pttUp()
+                            guard pttActive, pttReleaseTask == nil else { return }
+                            pttReleaseTask = Task {
+                                try? await Task.sleep(for: .milliseconds(200))
+                                guard !Task.isCancelled else { return }
+                                pttActive = false
+                                pttReleaseTask = nil
+                                viewModel.pttUp()
+                            }
                         }
                 )
         }

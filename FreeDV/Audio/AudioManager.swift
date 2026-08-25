@@ -1770,7 +1770,39 @@ class AudioManager: ObservableObject {
             appLog("TX: no radio connection — ignoring")
             return
         }
-        guard !isTransmitting else { return }
+        if isTransmitting {
+            // Re-key inside the stop-drain window: the previous over's EOO is
+            // still flushing and a delayed unkey is pending. Silently ignoring
+            // this press would let that unkey fire ~1 s into the user's new
+            // hold — the radio drops to RX under a held PTT. Cancel the unkey
+            // and resume transmitting instead.
+            guard txStopping else { return }
+            pendingTxUnkey?.cancel()
+            pendingTxUnkey = nil
+            txStopping = false
+            appLog("TX: re-key during stop drain — pending unkey cancelled, resuming transmit")
+            // Serialized behind the queued EOO so the modem restarts cleanly.
+            txQueue.async { [weak self] in self?.radeWrapper.txReset() }
+            // Re-assert PTT and TX-audio classification (noteFlushing set it
+            // to flushing). No mode reconfig here — a CI-V mode change while
+            // keyed would unkey the radio.
+            radio.setPTT(true)
+            let micFormat = inputNode.outputFormat(forBus: 0)
+            guard micFormat.channelCount > 0, micFormat.sampleRate > 0 else {
+                appLog("TX: invalid mic format on re-key — stopping")
+                stopTX()
+                return
+            }
+            if let monoFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                           sampleRate: micFormat.sampleRate,
+                                           channels: 1, interleaved: true) {
+                txMonoFormat = monoFmt
+                txConverter = AVAudioConverter(from: monoFmt, to: txSpeechFormat)
+            }
+            installTxTap(inputFormat: micFormat)
+            reporter?.reportTx(transmitting: true)
+            return
+        }
         appLog("TX: starting FreeDV transmit (engineRunning=\(audioEngine.isRunning) isRunning=\(isRunning))")
         txMicBufferCount = 0
         txModemSampleTotal = 0
@@ -1819,12 +1851,18 @@ class AudioManager: ObservableObject {
         installTxTap(inputFormat: inputFormat)
         _ = Self.removeTxDebugRecordingsOnce
         reporter?.reportTx(transmitting: true)
-        DispatchQueue.main.async { self.isTransmitting = true }
+        // Synchronous (startTX runs on main): an async flip could lose a PTT
+        // release arriving before it lands — stopTX would no-op and leave
+        // the radio keyed.
+        isTransmitting = true
     }
 
     /// True while a stopTX sequence (EOO flush + delayed unkey) is running —
     /// blocks a second stopTX from double-sending EOO and PTT-off.
     private var txStopping = false
+    /// The delayed PTT-off, cancellable so a re-key during the stop-drain
+    /// window resumes the over instead of unkeying mid-hold (main-thread only).
+    private var pendingTxUnkey: DispatchWorkItem?
 
     /// Stop transmitting: flush the End-Of-Over frame, unkey PTT, resume RX.
     func stopTX() {
@@ -1835,6 +1873,16 @@ class AudioManager: ObservableObject {
 
         let callsign = UserDefaults.standard.string(forKey: "reporter_callsign")
         let radio = radioController
+        let unkey = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            radio?.setPTT(false)
+            self.reporter?.reportTx(transmitting: false)
+            self.setRealtimeDecodePaused(false)
+            self.isTransmitting = false
+            self.txStopping = false
+            self.pendingTxUnkey = nil
+        }
+        pendingTxUnkey = unkey
         txQueue.async { [weak self] in
             guard let self = self else { return }
             let eoo = self.radeWrapper.txEndOfOver(callsign: callsign)
@@ -1846,13 +1894,8 @@ class AudioManager: ObservableObject {
             radio?.noteTxAudioFlushing()
             // Let the tail drain before unkeying: FIFO cushion (~200 ms) +
             // EOO (~144 ms) + padding (200 ms) + radio jitter buffer (400 ms).
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.1) {
-                radio?.setPTT(false)
-                self.reporter?.reportTx(transmitting: false)
-                self.setRealtimeDecodePaused(false)
-                self.isTransmitting = false
-                self.txStopping = false
-            }
+            // A cancelled work item (re-key during the drain) never runs.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.1, execute: unkey)
         }
     }
 
