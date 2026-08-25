@@ -20,7 +20,22 @@ struct FreeDVApp: App {
         do {
             container = try ModelContainer(for: schema, configurations: config)
         } catch {
-            fatalError("Failed to create ModelContainer: \(error)")
+            // The persistent store can be unavailable at launch — e.g. the app
+            // is started (or prewarmed) while the device is still locked and
+            // the data container is inaccessible, or the store is corrupted.
+            // Never hard-crash the launch: fall back to an in-memory store so
+            // the app opens; reception logging persists again on next launch.
+            appLog("ModelContainer failed (\(error)) — falling back to in-memory store")
+            let memoryConfig = ModelConfiguration(
+                "ReceptionLog",
+                schema: schema,
+                isStoredInMemoryOnly: true
+            )
+            do {
+                container = try ModelContainer(for: schema, configurations: memoryConfig)
+            } catch {
+                fatalError("Failed to create in-memory ModelContainer: \(error)")
+            }
         }
     }
     
