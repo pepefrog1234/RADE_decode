@@ -104,12 +104,17 @@ class AudioManager: ObservableObject {
     // FreeDV Reporter integration
     var reporter: FreeDVReporter?
 
-    /// Periodic rx_report state — desktop parity: report every 10 s while synced
-    /// (empty callsign allowed, it populates the SNR column on qso.freedv.org),
-    /// plus an immediate report on each new EOO callsign. Decode-queue access only.
+    /// Periodic rx_report state — desktop parity: freedv-gui reports every
+    /// ~0.5–1 s while RADE-synced (100 ms GUI timer × 10 ticks; live 2.3.1
+    /// stations measured at 0.5 s median). Consumers assume that cadence:
+    /// qso.freedv.org restarts a 20 s highlight fade per report, and station
+    /// maps use short freshness windows — anything sparser makes the row
+    /// visibly decay to "not receiving" between reports. Empty callsign is
+    /// the norm for these (it still fills the SNR column); an immediate
+    /// report with the callsign fires on each EOO decode.
+    /// Decode-queue access only.
     private var lastRxReportDate: Date = .distantPast
-    private var lastReportedCallsign: String = ""
-    private let rxReportInterval: TimeInterval = 10
+    private let rxReportInterval: TimeInterval = 1
     /// SNR of the most recent modem frame — the published `snr` property is not
     /// updated in background/deferred modes, so reports read this instead.
     private var latestFrameSNR: Float = 0
@@ -1151,7 +1156,6 @@ class AudioManager: ObservableObject {
                                                  latitude: lat, longitude: lon)
             // Report to FreeDV Reporter immediately on a new callsign; periodic
             // SNR reports continue from onModemFrameProcessed.
-            self.lastReportedCallsign = normalizedCallsign
             if !isDeferredReplay, let reporter = self.reporter, reporter.isReady {
                 reporter.reportRx(callsign: normalizedCallsign, snr: self.reporterSNRInt(currentSNR))
                 self.lastRxReportDate = Date()
@@ -1192,14 +1196,13 @@ class AudioManager: ObservableObject {
 
             self.latestFrameSNR = snr
 
-            // FreeDV Reporter: periodic rx_report while synced. The SNR column on
-            // qso.freedv.org is only populated by rx_report, so send one every
-            // 10 s with the current SNR even before any callsign is decoded.
+            // FreeDV Reporter: periodic rx_report while synced, desktop-style —
+            // empty callsign, current SNR, ~1 s cadence (see rxReportInterval).
             if !self.deferredReplayFastMode {
                 if isSynced {
                     if Date().timeIntervalSince(self.lastRxReportDate) >= self.rxReportInterval,
                        let reporter = self.reporter, reporter.isReady {
-                        reporter.reportRx(callsign: self.lastReportedCallsign,
+                        reporter.reportRx(callsign: "",
                                           snr: self.reporterSNRInt(snr))
                         self.lastRxReportDate = Date()
                     }

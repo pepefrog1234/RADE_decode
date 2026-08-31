@@ -68,7 +68,9 @@ Socket.IO 的訊息格式是在 WebSocket frame 前加上類型碼：
 ```
 當 RADE 解碼器成功解出一個呼號（EOO callsign）時發送。只有在收到伺服器的 `connection_successful` 後才能開始發送。
 
-**注意：** RADE V1 目前的 callsign 傳輸依賴 EOO（End-of-over）frame，也就是在對方停止發射時才解碼出呼號。所以 `rx_report` 是在 EOO 偵測到時發送的，不是每個 modem frame 都發。
+**注意：** RADE V1 目前的 callsign 傳輸依賴 EOO（End-of-over）frame，也就是在對方停止發射時才解碼出呼號。所以帶呼號的 `rx_report` 是在 EOO 偵測到時發送的。
+
+**週期回報（2026-09-01 實測修正）：** 桌面版 freedv-gui 在 RADE 同步期間會以**每 ~0.5–1 秒**一次的頻率持續送出「空呼號」的 `rx_report`（`{"callsign": "", "mode": "RADEV1", "snr": N}`；來源：main.cpp 100 ms timer × `m_reportCounter % 10`；對 qso.freedv.org 實測 FreeDV 2.3.1 電台 median 0.50 s、n=434）。網站每收到一筆就重啟該列 20 秒的藍色 highlight 淡出動畫（index.js `rxReportFn`，先 `stop(true,true)` 跳到底色再重新上色）。**回報週期若明顯大於數秒，該電台的列就會在兩次回報之間肉眼可見地褪回「未接收」底色** — v1.2 曾誤把桌面版節奏讀成 10 秒導致此問題（日本用戶回報 13 s/3 s 週期變色）。iOS 端現行作法：同步期間每 1 秒送空呼號報告，EOO 解碼時立即補一筆帶呼號的報告。
 
 #### `message_update` — 狀態訊息
 ```json
@@ -91,7 +93,12 @@ Socket.IO 的訊息格式是在 WebSocket frame 前加上類型碼：
 | `rx_report` | 其他電台收到訊號 |
 | `message_update` | 其他電台更新訊息 |
 
-每個事件 payload 都包含 `sid`（session ID）和 `last_update`（ISO 8601 時間戳）來識別電台。
+每個事件 payload 都包含 `sid`（session ID）和 `last_update`（ISO 8601 **字串**）來識別電台。
+
+**2026-09-01 實測補充：**
+- Engine.IO 握手參數為 `pingInterval=5000, pingTimeout=5000`（非預設的 25 s/20 s）— 客戶端若 ~10 秒內沒回 PONG 就會被伺服器踢掉，斷線後 `sid` 會換新。
+- 廣播的 `rx_report`／`freq_change` 等事件實際上**包在 `bulk_update` 裡送**（常見單筆的 `["bulk_update", [["rx_report", {...}]]]`），不只連線時才有 `bulk_update`。
+- 換頻等原因清除 RX 資料時，伺服器會廣播 `mode` 與 `callsign` 皆為空字串的 `rx_report`（網站以此清空該列的 Last RX/SNR 欄）。
 
 ### 1.5 連線生命週期
 

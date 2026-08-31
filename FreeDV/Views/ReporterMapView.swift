@@ -125,9 +125,15 @@ struct ReporterMapView: View {
         }
     }
 
-    // MARK: - Timeout (per spec: 5 seconds)
+    // MARK: - Timeout
 
-    private let rxTimeout: TimeInterval = 5
+    /// Freshness window for "receiving" state. Clients report at different
+    /// cadences while synced (freedv-gui ~0.5 s, wfweb ~4 s, RADE Decode iOS
+    /// builds ≤1.2 every 10 s), so anything under ~10 s makes slower
+    /// reporters' dots flap green↔gray between reports. qso.freedv.org keeps
+    /// its highlight for 20 s after the last report; 15 s is close to that
+    /// while still decaying reasonably fast after an over ends.
+    private let rxTimeout: TimeInterval = 15
 
     /// True if station has had an rx_report within the timeout window.
     private func isReceiving(_ station: ReporterStation) -> Bool {

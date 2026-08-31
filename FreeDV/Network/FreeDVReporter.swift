@@ -291,6 +291,11 @@ class FreeDVReporter {
             // Socket.IO CONNECT ACK — {"sid":"..."}
             DispatchQueue.main.async {
                 self.isConnected = true
+                // Every connection gets a fresh sid and the server follows the
+                // ack with a full roster bulk_update, so entries kept across a
+                // reconnect (disconnect(clearStations: false), or a dropped
+                // socket) would linger as duplicate ghost rows. Drop them now.
+                self.stations.removeAll()
             }
             appLog("Reporter: Socket.IO connected")
             
@@ -418,7 +423,8 @@ class FreeDVReporter {
         sendEvent("freq_change", ["freq": frequencyHz])
     }
     
-    /// Send rx_report when EOO callsign is decoded
+    /// Send rx_report: with the callsign on an EOO decode, or with an empty
+    /// callsign for the ~1 s periodic SNR reports sent while synced.
     func reportRx(callsign: String, snr: Int) {
         guard isReady else { return }
         sendEvent("rx_report", [
@@ -426,7 +432,11 @@ class FreeDVReporter {
             "mode": RADEMode.reporterModeString,
             "snr": snr
         ])
-        appLog("Reporter: rx_report sent — \(callsign) SNR=\(snr)")
+        // Periodic empty-callsign reports fire every second — logging them
+        // would flood the app log, so only callsign decodes are logged.
+        if !callsign.isEmpty {
+            appLog("Reporter: rx_report sent — \(callsign) SNR=\(snr)")
+        }
     }
 
     /// Report our transmit state (PTT down/up) — the site highlights the
