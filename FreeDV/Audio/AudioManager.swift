@@ -1774,12 +1774,24 @@ class AudioManager: ObservableObject {
             return
         }
         if isTransmitting {
+            guard txStopping else { return }
+            if let pendingStop = pendingTxStop {
+                // Re-key inside the stop GRACE window: nothing has gone out
+                // yet (no EOO, tap still installed, modem untouched) — cancel
+                // the stop and the over continues with zero on-air impact.
+                // This absorbs touch losses the 200 ms UI debounce misses
+                // (system-cancelled gestures were seen on newer devices).
+                pendingStop.cancel()
+                pendingTxStop = nil
+                txStopping = false
+                appLog("TX: re-key within stop grace — over continues seamlessly")
+                return
+            }
             // Re-key inside the stop-drain window: the previous over's EOO is
             // still flushing and a delayed unkey is pending. Silently ignoring
             // this press would let that unkey fire ~1 s into the user's new
             // hold — the radio drops to RX under a held PTT. Cancel the unkey
             // and resume transmitting instead.
-            guard txStopping else { return }
             pendingTxUnkey?.cancel()
             pendingTxUnkey = nil
             txStopping = false
@@ -1860,17 +1872,40 @@ class AudioManager: ObservableObject {
         isTransmitting = true
     }
 
-    /// True while a stopTX sequence (EOO flush + delayed unkey) is running —
-    /// blocks a second stopTX from double-sending EOO and PTT-off.
+    /// True while a stopTX sequence (grace + EOO flush + delayed unkey) is
+    /// running — blocks a second stopTX from double-sending EOO and PTT-off.
     private var txStopping = false
     /// The delayed PTT-off, cancellable so a re-key during the stop-drain
     /// window resumes the over instead of unkeying mid-hold (main-thread only).
     private var pendingTxUnkey: DispatchWorkItem?
+    /// The grace-delayed start of the stop sequence (main-thread only). While
+    /// this is pending nothing has gone on the air — cancelling it resumes
+    /// the over seamlessly. Once it runs, the EOO is out and only the
+    /// (audibly glitchy) re-key path can keep the radio keyed.
+    private var pendingTxStop: DispatchWorkItem?
+    /// Bounces the 200 ms UI debounce misses (e.g. a system-cancelled touch
+    /// delivering a spurious release) are absorbed here before the EOO goes
+    /// out. The radio stays keyed either way, so the only cost is the tail
+    /// running this much longer after a genuine release.
+    private let txStopGrace: TimeInterval = 0.3
 
-    /// Stop transmitting: flush the End-Of-Over frame, unkey PTT, resume RX.
+    /// Stop transmitting: after a short grace (see txStopGrace), flush the
+    /// End-Of-Over frame, unkey PTT, resume RX.
     func stopTX() {
         guard isTransmitting, !txStopping else { return }
         txStopping = true
+        let stop = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.pendingTxStop = nil
+            self.beginTxStopSequence()
+        }
+        pendingTxStop = stop
+        DispatchQueue.main.asyncAfter(deadline: .now() + txStopGrace, execute: stop)
+    }
+
+    /// The irreversible part of stopping: EOO + flush padding on the air,
+    /// then the delayed unkey. Runs on main after the stop grace.
+    private func beginTxStopSequence() {
         appLog("TX: stopping FreeDV transmit")
         removeTxTap()
 

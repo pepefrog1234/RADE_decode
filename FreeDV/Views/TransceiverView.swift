@@ -271,6 +271,7 @@ struct RadioControlPanel: View {
                                 // Touch back within the debounce window — keep transmitting.
                                 pending.cancel()
                                 pttReleaseTask = nil
+                                appLog("PTT: touch returned within debounce — hold continues")
                             }
                             guard !pttActive, viewModel.radioConnected, viewModel.isRunning else { return }
                             pttActive = true
@@ -283,6 +284,10 @@ struct RadioControlPanel: View {
                                 guard !Task.isCancelled else { return }
                                 pttActive = false
                                 pttReleaseTask = nil
+                                // Timestamps the UI-level release decision so
+                                // field logs can tell a real release from a
+                                // system-cancelled touch followed by a re-key.
+                                appLog("PTT: release debounce elapsed — unkey requested")
                                 viewModel.pttUp()
                             }
                         }
