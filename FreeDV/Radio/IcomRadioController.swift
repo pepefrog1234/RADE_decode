@@ -341,9 +341,15 @@ final class IcomRadioController: ObservableObject {
             guard let self, self.isConnected else { return }
             if self.frequencyHz == 0 {
                 guard attempt < 4 else {
-                    // Never configure blind — a freq=0 fallback once forced
-                    // USB-D on a 40 m dial. The first PTT configures correctly.
-                    appLog("Icom: frequency still unknown — leaving FreeDV config to the first PTT")
+                    // Frequency never arrived — run the freq-unknown-safe
+                    // config: data mode + DATA MOD=WLAN in the radio's CURRENT
+                    // sideband (configureForFreeDVTransmit's hz==0 branch never
+                    // guesses the sideband, so the old blind-USB-D-on-40m
+                    // hazard doesn't apply). Leaving this to the first PTT was
+                    // not safe: its fast path skips the WLAN assertion when
+                    // the radio already sits in the right sideband-D.
+                    appLog("Icom: frequency still unknown — configuring data mode + DATA MOD=WLAN in current sideband")
+                    self.configureForFreeDVTransmit()
                     return
                 }
                 appLog("Icom: frequency not read yet — delaying FreeDV config (try \(attempt))")
@@ -400,7 +406,21 @@ final class IcomRadioController: ObservableObject {
     func configureForFreeDVTransmitIfNeeded() {
         let target = freeDVMode(forHz: frequencyHz)
         if mode == target && dataMode {
-            appLog("Icom: FreeDV mode already \(target)-D — skipping reconfig")
+            // Mode and filter are right — but never trust the DATA MOD input:
+            // the connect-time config is skipped entirely when the frequency
+            // readback times out, the cached mode/dataMode survive reconnects,
+            // and the 0119 readback is never parsed, so a radio keyed with its
+            // own DATA MOD default (USB/MIC) transmits near-silence while
+            // everything else looks normal (found while triaging a quiet-TX
+            // field report; that radio turned out to be set correctly, but
+            // the hole is real). One idempotent set-frame per keyup guarantees
+            // the WLAN source and keeps the fast-path latency win (no
+            // mode/filter dance).
+            appLog("Icom: FreeDV mode already \(target)-D — re-asserting DATA MOD=WLAN")
+            withSerial {
+                $0.sendCiv(self.civ.setDataModInputFrame(.wlan))
+                $0.sendCiv(self.civ.readDataModInputFrame())
+            }
             return
         }
         configureForFreeDVTransmit()
