@@ -54,6 +54,8 @@
 "Delete All Recordings" = "刪除所有錄音";
 "Device" = "裝置";
 "Diagnostic Log" = "診斷日誌";
+"Diagnostics" = "診斷";
+"Open the log right after a test and tap Share to export it. Keep the app in the foreground during transmit tests." = "測試後立即開啟日誌並點「分享」匯出。發射測試期間請讓 app 保持在前景。";
 "Digital Voice Receiver" = "數位語音接收器";
 "Disconnected" = "未連線";
 "Done" = "完成";

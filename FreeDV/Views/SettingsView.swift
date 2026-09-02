@@ -260,7 +260,23 @@ struct SettingsView: View {
                 // Auto-record toggle uses @AppStorage
                 RecordingSettingsSection()
             }
-            
+
+            // Diagnostics: the in-app log viewer (with Share export) lost its
+            // navigation entry in ffa980f, so field testers could only export
+            // reception CSVs — TX troubleshooting needs the app log lines
+            // (speechPeak / modemPeak, audio route, FIFO underruns).
+            Section {
+                NavigationLink {
+                    LogView()
+                } label: {
+                    Label("Diagnostic Log", systemImage: "doc.text.magnifyingglass")
+                }
+            } header: {
+                Text("Diagnostics")
+            } footer: {
+                Text("Open the log right after a test and tap Share to export it. Keep the app in the foreground during transmit tests.")
+            }
+
             // RADE info section
             Section("RADE Info") {
                 LabeledContent("Modem Sample Rate", value: "8000 Hz")

@@ -54,6 +54,8 @@
 "Delete All Recordings" = "Delete All Recordings";
 "Device" = "Device";
 "Diagnostic Log" = "Diagnostic Log";
+"Diagnostics" = "Diagnostics";
+"Open the log right after a test and tap Share to export it. Keep the app in the foreground during transmit tests." = "Open the log right after a test and tap Share to export it. Keep the app in the foreground during transmit tests.";
 "Digital Voice Receiver" = "Digital Voice Receiver";
 "Disconnected" = "Disconnected";
 "Done" = "Done";
