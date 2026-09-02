@@ -135,6 +135,10 @@ class AudioManager: ObservableObject {
     /// True while transmitting FreeDV to the radio (half-duplex).
     @Published var isTransmitting = false
 
+    /// TX speech level actually fed to the encoder (post-AGC RMS, dBFS),
+    /// for the on-screen MIC meter while transmitting. −60 when idle.
+    @Published var txSpeechLevel: Float = -60
+
     /// 16 kHz mono Int16 format for LPCNet feature extraction (TX speech input).
     private let txSpeechFormat = AVAudioFormat(
         commonFormat: .pcmFormatInt16,
@@ -154,10 +158,19 @@ class AudioManager: ObservableObject {
         }
     }()
     private let txQueue = DispatchQueue(label: "com.freedv.rade.tx", qos: .userInitiated)
-    // TX diagnostics
+    /// Speech level control before LPCNet (see TxSpeechAGC). txQueue-confined.
+    private let txSpeechAGC = TxSpeechAGC()
+    // TX diagnostics (txQueue-confined). Speech stats are interval maxima /
+    // sums over the ~25 mic buffers between diagnostic log lines, so the log
+    // reflects the whole interval rather than the last 21 ms buffer.
     private var txMicBufferCount = 0
     private var txModemSampleTotal = 0
     private var txPacketCount = 0
+    private var txSpeechInPeak: Float = 0
+    private var txSpeechInSumSq: Float = 0
+    private var txSpeechOutPeak: Float = 0
+    private var txSpeechOutSumSq: Float = 0
+    private var txSpeechStatBuffers = 0
     
     // GPS tracking for reception log
     let locationTracker = LocationTracker()
@@ -196,6 +209,16 @@ class AudioManager: ObservableObject {
             return Float(value)
         }
         set { UserDefaults.standard.set(Double(newValue), forKey: "rxInputGainDb") }
+    }
+
+    /// Manual TX mic trim in dB, applied after the automatic speech level
+    /// control (TxSpeechAGC). 0 dB is the calibrated default.
+    static var txMicGainDb: Float {
+        get {
+            let value = UserDefaults.standard.object(forKey: "txMicGainDb") as? Double ?? 0.0
+            return Float(value)
+        }
+        set { UserDefaults.standard.set(Double(newValue), forKey: "txMicGainDb") }
     }
     
     /// Saved ID for the user's preferred speaker output device.
@@ -1822,6 +1845,15 @@ class AudioManager: ObservableObject {
         txMicBufferCount = 0
         txModemSampleTotal = 0
         txPacketCount = 0
+        let micTrimDb = AudioManager.txMicGainDb
+        txQueue.async { [weak self] in
+            guard let self = self else { return }
+            // Fresh over: forget the previous talker's level, restart stats.
+            self.txSpeechAGC.reset()
+            self.txSpeechAGC.manualGainDb = micTrimDb
+            self.resetTxSpeechStats()
+        }
+        appLog(String(format: "TX: speech AGC armed (target -18 dBFS, manual trim %+.0f dB)", micTrimDb))
 
         if !audioEngine.isRunning {
             appLog("TX: audio engine not running — starting it for mic capture")
@@ -1917,6 +1949,7 @@ class AudioManager: ObservableObject {
             self.reporter?.reportTx(transmitting: false)
             self.setRealtimeDecodePaused(false)
             self.isTransmitting = false
+            self.txSpeechLevel = -60
             self.txStopping = false
             self.pendingTxUnkey = nil
         }
@@ -2003,11 +2036,27 @@ class AudioManager: ObservableObject {
         txQueue.async { [weak self] in
             guard let self = self, self.isTransmitting else { return }
             self.txMicBufferCount += 1
-            var speechPeak: Int16 = 0
-            for s in copy { let a = s == Int16.min ? Int16.max : abs(s); if a > speechPeak { speechPeak = a } }
-            let modem = copy.withUnsafeBufferPointer { buf -> [Int16]? in
+
+            // Level control before the encoder: RADE reproduces whatever
+            // level goes in, and the raw .measurement mic is far too quiet
+            // (field log: speech peaks -26...-53 dBFS).
+            let speech = self.txSpeechAGC.process(copy)
+            let agc = self.txSpeechAGC
+            self.txSpeechInPeak = max(self.txSpeechInPeak, agc.lastInputPeak)
+            self.txSpeechInSumSq += agc.lastInputRMS * agc.lastInputRMS
+            self.txSpeechOutPeak = max(self.txSpeechOutPeak, agc.lastOutputPeak)
+            self.txSpeechOutSumSq += agc.lastOutputRMS * agc.lastOutputRMS
+            self.txSpeechStatBuffers += 1
+
+            // MIC meter (~every 40 ms): the level that actually goes on air.
+            if self.txMicBufferCount % 2 == 0 {
+                let levelDb = 20 * log10f(max(agc.lastOutputRMS, 1e-5))
+                DispatchQueue.main.async { self.txSpeechLevel = levelDb }
+            }
+
+            let modem = speech.withUnsafeBufferPointer { buf -> [Int16]? in
                 guard let ptr = buf.baseAddress else { return nil }
-                return self.radeWrapper.txProcessSpeechSamples(ptr, count: Int32(count))
+                return self.radeWrapper.txProcessSpeechSamples(ptr, count: Int32(speech.count))
             }
             var modemPeak: Int16 = 0
             if let modem = modem, !modem.isEmpty {
@@ -2015,11 +2064,30 @@ class AudioManager: ObservableObject {
                 for s in modem { let a = s == Int16.min ? Int16.max : abs(s); if a > modemPeak { modemPeak = a } }
                 self.sendTxModemSamples(modem)
             }
-            // Periodic TX diagnostic (~every 25 mic buffers).
+            // Periodic TX diagnostic (~every 25 mic buffers = 0.5 s). Speech
+            // figures cover the whole interval: raw mic peak/RMS, the AGC gain
+            // in force, and the post-AGC level fed to the encoder.
             if self.txMicBufferCount % 25 == 0 {
-                appLog("TX: micBuffers=\(self.txMicBufferCount) modemSamples=\(self.txModemSampleTotal) packets=\(self.txPacketCount) speechPeak=\(speechPeak)/32767 modemPeak=\(modemPeak)/32767")
+                let n = Float(max(self.txSpeechStatBuffers, 1))
+                let inPeak = Int(self.txSpeechInPeak * 32767)
+                let inRms = 20 * log10f(max(sqrtf(self.txSpeechInSumSq / n), 1e-5))
+                let outRms = 20 * log10f(max(sqrtf(self.txSpeechOutSumSq / n), 1e-5))
+                let outPeakDb = 20 * log10f(max(self.txSpeechOutPeak, 1e-5))
+                appLog(String(format: "TX: micBuffers=%ld modemSamples=%ld packets=%ld speechPeak=%ld/32767 speechRMS=%.1fdBFS agc=%+.1fdB trim=%+.0fdB txLevel=%.1fdBFS txPeak=%.1fdBFS modemPeak=%ld/32767",
+                              self.txMicBufferCount, self.txModemSampleTotal, self.txPacketCount,
+                              inPeak, inRms, agc.gainDb, agc.manualGainDb, outRms, outPeakDb, Int(modemPeak)))
+                self.resetTxSpeechStats()
             }
         }
+    }
+
+    /// Restart the interval speech statistics (txQueue-confined).
+    private func resetTxSpeechStats() {
+        txSpeechInPeak = 0
+        txSpeechInSumSq = 0
+        txSpeechOutPeak = 0
+        txSpeechOutSumSq = 0
+        txSpeechStatBuffers = 0
     }
 
     /// Send modem samples to the radio in ~20 ms chunks (160 samples @ 8 kHz).

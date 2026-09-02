@@ -51,6 +51,8 @@ class TransceiverViewModel: ObservableObject {
     @Published var freqOffset: Float = 0
     @Published var inputLevel: Float = -60
     @Published var outputLevel: Float = -60
+    /// Post-AGC TX speech level (dBFS) for the MIC meter while transmitting.
+    @Published var txSpeechLevel: Float = -60
     @Published var effectiveFFTEnabled = true
     @Published var autoLowLoadModeActive = false
     
@@ -172,6 +174,7 @@ class TransceiverViewModel: ObservableObject {
                 self.freqOffset = self.audioManager.freqOffset
                 self.inputLevel = self.audioManager.inputLevel
                 self.outputLevel = self.audioManager.outputLevel
+                self.txSpeechLevel = self.audioManager.txSpeechLevel
 
                 // Skip FFT/waterfall updates in background (saves CPU + memory)
                 if !self.isInBackground {

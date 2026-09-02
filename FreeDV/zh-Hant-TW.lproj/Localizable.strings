@@ -55,6 +55,8 @@
 "Device" = "裝置";
 "Diagnostic Log" = "診斷日誌";
 "Diagnostics" = "診斷";
+"TX Mic Gain" = "發射麥克風增益";
+"Trim applied after the automatic mic level control. Leave at 0 dB unless the other station reports your voice too loud or too quiet." = "自動電平控制之後的手動微調。除非對方反映你的聲音太大或太小，否則保持 0 dB。";
 "Open the log right after a test and tap Share to export it. Keep the app in the foreground during transmit tests." = "測試後立即開啟日誌並點「分享」匯出。發射測試期間請讓 app 保持在前景。";
 "Digital Voice Receiver" = "數位語音接收器";
 "Disconnected" = "未連線";

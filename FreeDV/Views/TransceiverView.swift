@@ -103,9 +103,15 @@ struct TransceiverView: View {
                         .padding(.horizontal, 16)
                         .padding(.top, 8)
                         
-                        // Level meters
+                        // Level meters. While transmitting, the IN meter (RX
+                        // modem level) is meaningless, so it becomes the MIC
+                        // meter: the post-AGC speech level fed to the encoder.
                         VStack(spacing: 6) {
-                            MeterView(label: "IN", level: viewModel.inputLevel)
+                            if viewModel.radioIsTransmitting {
+                                MeterView(label: "MIC", level: viewModel.txSpeechLevel)
+                            } else {
+                                MeterView(label: "IN", level: viewModel.inputLevel)
+                            }
                             MeterView(label: "OUT", level: viewModel.outputLevel)
                         }
                         .padding(.horizontal, 16)

@@ -794,6 +794,7 @@ struct RadioSettingsSection: View {
     @AppStorage("radioControlPort") private var controlPort = Int(RadioSettings.defaultControlPort)
     @AppStorage("radioUsername") private var username = ""
     @AppStorage("radioEnableTx") private var enableTx = true
+    @AppStorage("txMicGainDb") private var txMicGainDb: Double = 0
     @State private var password = ""
 
     private var radioSelected: Bool { audioSourceRaw == AudioInputSource.icomRadio.rawValue }
@@ -843,6 +844,20 @@ struct RadioSettingsSection: View {
                         }
                 }
                 Toggle("Enable Transmit", isOn: $enableTx)
+                if enableTx {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("TX Mic Gain")
+                            Spacer()
+                            Text(String(format: "%+.0f dB", txMicGainDb))
+                                .foregroundStyle(.secondary)
+                        }
+                        Slider(value: $txMicGainDb, in: -12...12, step: 1)
+                        Text("Trim applied after the automatic mic level control. Leave at 0 dB unless the other station reports your voice too loud or too quiet.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
 
                 HStack {
                     Text("Connection")
