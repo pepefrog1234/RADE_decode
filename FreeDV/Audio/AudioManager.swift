@@ -988,14 +988,21 @@ class AudioManager: ObservableObject {
     // MARK: - Audio Session Setup
     
     #if os(iOS)
-    /// Foreground modem decode prefers raw capture (`.measurement`).
-    /// Background execution uses `.default` for better iOS reliability.
-    /// IC-705 network mode also uses `.measurement`: the TX mic must be raw
-    /// (input AGC pumps the encoder speech), and switching modes mid-engine
-    /// at PTT proved unreliable (the mic sometimes goes silent after the
-    /// route change). The quieter `.measurement` speaker profile is
-    /// compensated by the decoded-speech makeup gain.
+    /// Device (SWL) mode decodes the modem waveform from the mic, so the
+    /// foreground uses raw capture (`.measurement`); background execution
+    /// uses `.default` for better iOS reliability.
+    ///
+    /// IC-705 network mode uses `.default` for the WHOLE session: the modem
+    /// never comes from the mic there, and `.measurement` strips the system's
+    /// output processing too — the built-in speaker plays noticeably quieter
+    /// and no digital makeup can recover it (field report: "speaker quiet
+    /// even at maximum volume"). `.measurement` was previously kept for a raw
+    /// TX mic, but the TX speech level is now handled by TxSpeechAGC, which
+    /// also re-levels whatever mild input processing `.default` applies. The
+    /// mode is never switched mid-session (a switch at PTT once left the mic
+    /// silent on some devices).
     private func preferredSessionModeForCurrentState() -> AVAudioSession.Mode {
+        if RadioSettings.audioInputSource == .icomRadio { return .default }
         return backgroundMode ? .default : .measurement
     }
     
@@ -1853,7 +1860,12 @@ class AudioManager: ObservableObject {
             self.txSpeechAGC.manualGainDb = micTrimDb
             self.resetTxSpeechStats()
         }
-        appLog(String(format: "TX: speech AGC armed (target -18 dBFS, manual trim %+.0f dB)", micTrimDb))
+        #if os(iOS)
+        let sessionMode = AVAudioSession.sharedInstance().mode.rawValue
+        #else
+        let sessionMode = "n/a"
+        #endif
+        appLog(String(format: "TX: speech AGC armed (target -18 dBFS, manual trim %+.0f dB, session mode %@)", micTrimDb, sessionMode))
 
         if !audioEngine.isRunning {
             appLog("TX: audio engine not running — starting it for mic capture")
@@ -1875,9 +1887,10 @@ class AudioManager: ObservableObject {
         setRealtimeDecodePaused(true)
         radeWrapper.txReset()
 
-        // (The session already runs in .measurement — raw mic, no input AGC.
-        // Switching modes here mid-engine proved to silence the mic on some
-        // devices, so the mode is now fixed for the whole session.)
+        // No session-mode switch here: the mode is fixed for the whole
+        // session (`.default` in IC-705 mode, see
+        // preferredSessionModeForCurrentState). A switch at PTT once left
+        // the mic silent on some devices; the speech level is TxSpeechAGC's job.
         radio.configureForFreeDVTransmitIfNeeded()
         radio.setPTT(true)
 
@@ -2403,21 +2416,24 @@ class AudioManager: ObservableObject {
     
     // MARK: - Audio Output
     
-    /// V1's conservative FARGAN output needs makeup gain on the quiet
-    /// `.measurement` speaker route. V2 can contain substantially larger
-    /// decoded peaks on an acoustic channel; applying the same +8 dB gain
-    /// hard-clips those peaks and turns intelligible speech into distortion.
+    /// V1's conservative FARGAN output needs makeup gain on the phone
+    /// speaker. V2 can contain substantially larger decoded peaks on an
+    /// acoustic channel; applying the same +8 dB gain would clip those peaks
+    /// and turn intelligible speech into distortion. Peaks above −3 dBFS go
+    /// through a soft limiter rather than a hard clamp: senders running this
+    /// app's TX AGC arrive around −18 dBFS RMS, and ×2.5 would otherwise
+    /// hard-clip their peaks.
     private let v1SpeechMakeupGain: Float = 2.5
     private let v2SpeechMakeupGain: Float = 1.0
 
     /// Enqueue decoded speech into the ring buffer for the source node to consume.
     private func playDecodedAudio(samples: UnsafePointer<Int16>, count: Int) {
-        // Convert int16 → float with mode-appropriate makeup gain. The user
-        // volume slider still applies later in the render callback.
+        // Convert int16 → float with mode-appropriate makeup gain and a soft
+        // limiter. The user volume still applies later in the render callback.
         let makeupGain = radeWrapper.isV2 ? v2SpeechMakeupGain : v1SpeechMakeupGain
         var floats = [Float](repeating: 0, count: count)
         for i in 0..<count {
-            floats[i] = max(-1.0, min(1.0, Float(samples[i]) * makeupGain / 32768.0))
+            floats[i] = TxSpeechAGC.softLimit(Float(samples[i]) * makeupGain / 32768.0)
         }
         
         // Calculate output level for meter (skip in background)

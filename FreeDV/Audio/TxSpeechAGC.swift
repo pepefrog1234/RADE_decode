@@ -49,6 +49,16 @@ final class TxSpeechAGC {
     /// Current automatic gain in dB (excludes the manual trim).
     var gainDb: Float { 20 * log10f(max(gain, 1e-6)) }
 
+    /// Soft limiter: linear below the knee (−3 dBFS), then a tanh curve that
+    /// approaches ±1.0 asymptotically, so no input can wrap or hard-clip.
+    /// Shared with the RX makeup stage.
+    static func softLimit(_ y: Float, knee: Float = 0.7) -> Float {
+        let a = abs(y)
+        guard a > knee else { return y }
+        let limited = knee + (1 - knee) * tanhf((a - knee) / (1 - knee))
+        return y < 0 ? -limited : limited
+    }
+
     /// Start a fresh over: forget the previous talker's level.
     func reset() {
         gain = initialGain
@@ -91,13 +101,7 @@ final class TxSpeechAGC {
             // Smooth toward the desired gain: fast when reducing, slow when raising.
             let coef = desired < g ? attackCoef : releaseCoef
             g = coef * g + (1 - coef) * desired
-            var y = x[i] * g * manual
-            let a = abs(y)
-            if a > kneeLevel {
-                let over = (a - kneeLevel) / (1 - kneeLevel)
-                let limited = kneeLevel + (1 - kneeLevel) * tanhf(over)
-                y = y < 0 ? -limited : limited
-            }
+            let y = TxSpeechAGC.softLimit(x[i] * g * manual, knee: kneeLevel)
             outSumSq += y * y
             let ay = abs(y)
             if ay > outPeak { outPeak = ay }
