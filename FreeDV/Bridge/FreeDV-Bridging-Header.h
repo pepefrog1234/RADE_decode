@@ -3,6 +3,10 @@
 
 #include <TargetConditionals.h>
 
+/* Objective-C exception guard (all platforms, including the simulator):
+   returns AVFAudio precondition NSExceptions to Swift instead of aborting. */
+#import "FDVExceptionGuard.h"
+
 #if !TARGET_OS_SIMULATOR
 
 /* RADE C API - Swift can call these directly */

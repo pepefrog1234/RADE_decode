@@ -840,8 +840,10 @@ class AudioManager: ObservableObject {
     }
     
     /// Check if the audio engine is still running and restart if needed.
-    /// Call this periodically or after interruptions.
+    /// Call this periodically or after interruptions. Main thread only: it
+    /// may install the mic tap (see "Mic bus tap").
     func checkEngineHealth() {
+        assert(Thread.isMainThread, "checkEngineHealth must run on the main thread")
         guard isRunning else { return }
 
         if !audioEngine.isRunning {
@@ -873,7 +875,12 @@ class AudioManager: ObservableObject {
 
     /// Recover RX pipeline when watchdog detects stale input/frame activity.
     /// This handles cases where old devices keep engine alive but input tap stops delivering.
+    /// Main thread only: it removes and installs the mic tap (see "Mic bus tap").
     private func recoverRXPipelineIfNeeded(reason: String) {
+        assert(Thread.isMainThread, "recoverRXPipelineIfNeeded must run on the main thread")
+        // The watchdog decided on processingQueue; RX may have been stopped
+        // while the hop to main was in flight.
+        guard isRunning else { return }
         // Don't disturb the pipeline while transmitting — TX owns the input tap
         // and restarting the engine would kill the outgoing audio.
         guard !isTransmitting else { return }
@@ -956,13 +963,21 @@ class AudioManager: ObservableObject {
                 }
                 bgLog("Health tick: engine=\(engineRunning) pending=\(pending) dropped=\(dropped) load=\(loadLevel) synced=\(isSynced) boost=\(boost)")
             }
+            // Recovery mutates the engine and the tap flags, which are
+            // main-thread state (see "Mic bus tap"): decide here on
+            // processingQueue, act on main. Build 15 crashed when this handler
+            // installed the tap directly from this queue while main-thread
+            // code was doing the same (AVFAudio "nullptr == Tap()").
             if !engineRunning {
                 bgLog("Health check: engine NOT running — restarting")
-                self.checkEngineHealth()
+                DispatchQueue.main.async { self.checkEngineHealth() }
             }
 
             if let lastInput, now.timeIntervalSince(lastInput) > self.rxInputStallThreshold {
-                self.recoverRXPipelineIfNeeded(reason: "no input callback for \(Int(now.timeIntervalSince(lastInput)))s")
+                let stalledFor = Int(now.timeIntervalSince(lastInput))
+                DispatchQueue.main.async {
+                    self.recoverRXPipelineIfNeeded(reason: "no input callback for \(stalledFor)s")
+                }
                 return
             }
 
@@ -971,7 +986,10 @@ class AudioManager: ObservableObject {
             if shouldCheckFrameStall,
                let lastFrame,
                now.timeIntervalSince(lastFrame) > self.rxFrameStallThreshold {
-                self.recoverRXPipelineIfNeeded(reason: "no modem frames for \(Int(now.timeIntervalSince(lastFrame)))s")
+                let stalledFor = Int(now.timeIntervalSince(lastFrame))
+                DispatchQueue.main.async {
+                    self.recoverRXPipelineIfNeeded(reason: "no modem frames for \(stalledFor)s")
+                }
             }
         }
         timer.resume()
@@ -1465,35 +1483,109 @@ class AudioManager: ObservableObject {
         }
     }
 
-    private func installInputTapIfNeeded(with inputFormat: AVAudioFormat) {
-        guard !isInputTapInstalled else { return }
+    // MARK: - Mic bus tap (bus 0)
+    //
+    // Main thread only. The tap flags are plain Bools, and every engine/tap
+    // mutation — startRX, stop, the TX tap, checkEngineHealth and the RX
+    // watchdog's recovery — runs on main so none of them can interleave.
+    // Build 15 crashed in the field when the watchdog installed the RX tap
+    // from processingQueue: AVFAudio found a tap already on the bus while the
+    // flag said none and raised its precondition ("nullptr == Tap()"), an
+    // NSException Swift cannot catch, which aborted the app.
+    //
+    // Defensive layers on top of the main-thread rule:
+    //  1. The flag is only a hint: the bus is cleared unconditionally right
+    //     before installing (removeTap is a safe no-op on an empty bus).
+    //  2. AVFAudio also refuses a tap whose sample rate differs from the
+    //     hardware input rate. After a route change the node's output format
+    //     and the hardware format can lag each other, so both rates are tried.
+    //  3. installTap runs under an Objective-C exception guard: a residual
+    //     precondition failure is logged and the bus is left untapped for the
+    //     watchdog to retry, instead of terminating the process.
+
+    /// Install `block` as the tap on mic bus 0, trying `formats` in order.
+    /// Returns the format that took, or nil when AVFAudio refused every one
+    /// (each refusal is logged).
+    private func installMicTap(formats: [AVAudioFormat],
+                               bufferSize: AVAudioFrameCount,
+                               label: String,
+                               block: @escaping AVAudioNodeTapBlock) -> AVAudioFormat? {
+        assert(Thread.isMainThread, "installMicTap must run on the main thread")
+        let node = inputNode
+        // Clear the bus regardless of what the flags say (safe no-op if empty).
+        node.removeTap(onBus: 0)
+        for format in formats {
+            let exception = FDVCatchObjCException {
+                node.installTap(onBus: 0, bufferSize: bufferSize, format: format, block: block)
+            }
+            guard let exception else { return format }
+            appLog("ERROR: \(label) installTap refused for \(Int(format.sampleRate)) Hz ch=\(format.channelCount): \(exception.name.rawValue) — \(exception.reason ?? "no reason")")
+        }
+        return nil
+    }
+
+    /// Tap format candidates for the mic bus: the node's reported output
+    /// format first and, if it disagrees, Float32 at the hardware input rate.
+    private func micTapFormatCandidates(preferred: AVAudioFormat) -> [AVAudioFormat] {
+        var candidates = [preferred]
+        let hwFormat = inputNode.inputFormat(forBus: 0)
+        if hwFormat.sampleRate > 0, hwFormat.channelCount > 0,
+           hwFormat.sampleRate != preferred.sampleRate,
+           let hwRateFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                            sampleRate: hwFormat.sampleRate,
+                                            channels: hwFormat.channelCount,
+                                            interleaved: false) {
+            appLog("WARN: input node reports \(Int(preferred.sampleRate)) Hz but hardware input is \(Int(hwFormat.sampleRate)) Hz — will fall back to the hardware rate")
+            candidates.append(hwRateFormat)
+        }
+        return candidates
+    }
+
+    /// Install the RX tap if none is installed. Returns true when a tap is
+    /// installed on return (already present, or installed now).
+    @discardableResult
+    private func installInputTapIfNeeded(with inputFormat: AVAudioFormat) -> Bool {
+        assert(Thread.isMainThread, "installInputTapIfNeeded must run on the main thread")
+        guard !isInputTapInstalled else { return true }
         // Never install the RX tap while transmitting (TX owns bus 0's tap), or
         // in IC-705 mode where modem audio arrives over the network, not the mic.
-        guard !txTapInstalled, !isTransmitting else { return }
-        if RadioSettings.audioInputSource == .icomRadio { return }
+        guard !txTapInstalled, !isTransmitting else { return false }
+        if RadioSettings.audioInputSource == .icomRadio { return false }
 
         // Validate format — inputNode.outputFormat can return 0 channels / 0 Hz
         // when the audio session isn't fully ready or the route changed.
-        // installTap throws an unrecoverable NSException if the format is invalid.
         guard inputFormat.channelCount > 0, inputFormat.sampleRate > 0 else {
             appLog("ERROR: invalid input format (ch=\(inputFormat.channelCount) sr=\(inputFormat.sampleRate)) — skipping tap install")
-            return
+            return false
         }
 
-        inputNode.installTap(onBus: 0, bufferSize: 960,
-                            format: inputFormat) { [weak self] buffer, _ in
-            self?.processRXInput(buffer: buffer)
+        guard let installed = installMicTap(formats: micTapFormatCandidates(preferred: inputFormat),
+                                            bufferSize: 960,
+                                            label: "RX",
+                                            block: { [weak self] buffer, _ in
+                                                self?.processRXInput(buffer: buffer)
+                                            }) else {
+            appLog("ERROR: RX tap not installed — the watchdog will retry")
+            return false
+        }
+        if installed.sampleRate != inputFormat.sampleRate {
+            // Fell back to the hardware rate: the converter must match the
+            // buffers the tap will actually deliver.
+            configureInputConverter(for: installed)
         }
         isInputTapInstalled = true
+        return true
     }
 
     private func removeInputTapIfInstalled() {
+        assert(Thread.isMainThread, "removeInputTapIfInstalled must run on the main thread")
         guard isInputTapInstalled else { return }
         inputNode.removeTap(onBus: 0)
         isInputTapInstalled = false
     }
     
     func startRX() {
+        assert(Thread.isMainThread, "startRX must run on the main thread")
         guard !isRunning else { return }
 
         // Apply a pending RADE V1/V2 switch — safe here because decoding is
@@ -1984,17 +2076,31 @@ class AudioManager: ObservableObject {
     }
 
     private func installTxTap(inputFormat: AVAudioFormat) {
+        assert(Thread.isMainThread, "installTxTap must run on the main thread")
         guard inputFormat.channelCount > 0, inputFormat.sampleRate > 0 else {
             appLog("TX: invalid mic format — cannot install tap")
             return
         }
-        // installTap asserts if a tap already exists on the bus. Clear any tap
-        // (RX tap or one installed by the RX watchdog) first. removeTap is a
-        // safe no-op when none is installed.
-        inputNode.removeTap(onBus: 0)
+        // installMicTap clears the bus first (the RX tap, or one installed by
+        // the RX watchdog) and runs installTap under the exception guard.
         isInputTapInstalled = false
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
-            self?.processTXInput(buffer: buffer)
+        guard let installed = installMicTap(formats: micTapFormatCandidates(preferred: inputFormat),
+                                            bufferSize: 1024,
+                                            label: "TX",
+                                            block: { [weak self] buffer, _ in
+                                                self?.processTXInput(buffer: buffer)
+                                            }) else {
+            appLog("TX: ERROR mic tap not installed — no speech will be sent this over")
+            txTapInstalled = false
+            return
+        }
+        if installed.sampleRate != inputFormat.sampleRate,
+           let monoFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                       sampleRate: installed.sampleRate,
+                                       channels: 1, interleaved: true) {
+            // Fell back to the hardware rate: the speech converter must match.
+            txMonoFormat = monoFmt
+            txConverter = AVAudioConverter(from: monoFmt, to: txSpeechFormat)
         }
         txTapInstalled = true
     }
@@ -2601,9 +2707,11 @@ class AudioManager: ObservableObject {
     @objc private func handleMediaServicesReset(notification: Notification) {
         bgLog("Media services were reset — rebuilding audio engine")
         // Media services reset destroys all audio objects.
-        // We need to stop and restart RX from scratch.
-        if isRunning {
-            stop()
+        // We need to stop and restart RX from scratch. stop()/startRX() mutate
+        // the engine and tap flags, so run them on main whatever thread posted.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isRunning else { return }
+            self.stop()
             // Brief delay to let the system stabilize, then restart
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                 self?.startRX()
